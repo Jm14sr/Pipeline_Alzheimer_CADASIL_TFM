@@ -1,0 +1,3336 @@
+---
+title: "TFM_3_ML_GANS"
+author: "Juan Manuel Sancho Romero"
+date: "2025-04-17"
+output:
+  html_document:
+    df_print: paged
+    toc: yes
+    toc_float: true
+    code_folding: show
+    theme: united
+    higlight: tango
+  pdf_document:
+    keep_tex: yes
+    toc: yes
+header-includes: \usepackage[spanish]{babel}
+params:
+  file1: caracteristics_ppi_ALZHEIMER.csv
+  folder.data: C:/Users/juanm/Desktop/MASTER_BIOINFORMATICA/0_TFM_Bioinf/TFM_Resultados
+  p.train: 0.75 # 75% de los datos para definir el conjunto de entrenamiento
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages, message=FALSE, echo=FALSE, warning=FALSE}
+libraries <- c("ggplot2", "dplyr", "e1071", "gmodels",  "ROCR", "caret", "C50", "randomForest", "class", "klaR", "kernlab", "kableExtra", "DMwR", "ggfortify", "nortest", "dplyr", "FNN")
+check.libraries <- is.element(libraries, installed.packages()[, 1])==FALSE
+libraries.to.install <- libraries[check.libraries]
+if (length(libraries.to.install!=0)) {
+  install.packages(libraries.to.install)
+}
+
+library("knitr")
+library("kableExtra")
+library("reticulate")
+library("ggplot2")
+library("dplyr")
+library("e1071")
+library("gmodels")
+library("ROCR")
+library("caret")
+
+# KNN
+library("class")
+
+# Naive-Bayes
+library("klaR")
+
+# SVM
+library("kernlab")
+
+# Tree
+library("C50")
+
+# Random Forest
+library("randomForest")
+
+```
+
+
+Establecer el entorno de `Pyhton` con `tensorFlow`, `Pytorch`, `Networkz` y otras librerías necesarias instaladas.
+```{r eval=FALSE, include=FALSE}
+reticulate::use_condaenv("tfm_ml", required = TRUE)
+```
+
+# 1. Exploración y Preparación de los Datos
+
+## 1.1 Exploración de los Datos
+
+Importamos el fichero con los datos.
+```{r, echo=FALSE}
+
+caracteristics_ppi_ALZ <- read.csv(
+  file.path(params$folder.data, params$file1), 
+  sep=",",            # Especifica que el separador de columnas es una coma
+  dec=".",            # Define que el separador decimal es un punto
+  header=TRUE,        # Indica que la primera fila contiene los nombres de las columnas
+  stringsAsFactors=FALSE # Evita que las columnas se conviertan en factores automáticamente
+)
+
+```
+
+**Dimensiones.**
+```{r}
+dim(caracteristics_ppi_ALZ)
+```
+
+**Primeras filas.**
+```{r}
+head(caracteristics_ppi_ALZ)
+```
+
+**Estructura del dataframe.**
+```{r}
+str(caracteristics_ppi_ALZ)
+```
+
+Por ahora vamos a quitar la columna que contiene el número de fármacos probados para ese gen por si fuera demasiado informativa para los modelos.
+```{r}
+caracteristics_ppi_ALZ <- caracteristics_ppi_ALZ[, !names(caracteristics_ppi_ALZ) %in% "Num_Drugs"]
+```
+
+**Resumen estadístico.**
+```{r}
+summary(caracteristics_ppi_ALZ)
+```
+
+**Estructura del nuevo dataframe.**
+```{r}
+str(caracteristics_ppi_ALZ)
+```
+
+**Gráfico de Boxplot múltiple** para comparar las distribuciones de las distintas características.
+```{r}
+# Cargar librerías necesarias
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+# Convertir a formato largo (long format) para ggplot2
+df_long <- caracteristics_ppi_ALZ %>%
+  pivot_longer(cols = -Gene, names_to = "Metric", values_to = "Value")
+
+ggplot(df_long, aes(x = Metric, y = Value, fill = Metric)) +
+  geom_boxplot() +
+  scale_y_log10() +  # Aplica escala logarítmica para mejorar la visualización
+  labs(title = "Distribución de Variables PPI", x = "Métrica", y = "Valor (log10)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+
+# 1.2 Preparación de los Datos
+
+```{r}
+# Crear un vector con los nombres de los genes
+genes_alzheimer <- c("APP", "MAPT", "APOE", "CD2AP", "CLU", "PICALM", "BIN1", "TREM2", "SOD1", "SORL1", "ABCA7", "ABCA1", "ADAMTS4", "GSK3B", "GRN", "PSAP", "ACHE", "CACNA1D", "CACNA1C", "BACE", "BACE1", "BACE2", "ASP2", "KIAA1149", "GRIA", "GRIA1", "GRIA4", "D2R", "DRD2 ", "HTR6", "PPARG", "TARDBP", "AGER", "MAO", "MAOA", "MAOB", "GRIN1", "GRIN2A", "GRIN2B", "GRIN2C", "GRIN2D", "GRIN3A", "GRIN3B") 
+
+# Convertir el vector en un dataframe
+df_genes_diana <- data.frame(Gene = genes_alzheimer)
+
+# Mostrar el dataframe
+print(df_genes_diana)
+
+```
+
+
+Agregamos la columna `Therapeutic_Target` a `caracteristics_ppi_ALZ`. Considerando dianas terapéuticas los genes incluidos en `df_genes_diana`.
+```{r}
+# Cargar dplyr
+library(dplyr)
+
+# Agregar la columna Therapeutic_Target (1 si está en df_genes_diana, 0 si no)
+caracteristics_ppi_ALZ <- caracteristics_ppi_ALZ %>%
+  mutate(Therapeutic_Target = ifelse(Gene %in% df_genes_diana$Gene, 1, 0))
+
+# Verificar los primeros resultados
+head(caracteristics_ppi_ALZ)
+```
+
+
+Contar Nº de dianas terapéuticas del dataset.
+```{r}
+# Contar el número de dianas terapéuticas
+num_dianas <- sum(caracteristics_ppi_ALZ$Therapeutic_Target == 1)
+
+# Mostrar el resultado
+print(paste("Número de dianas terapéuticas en el dataset:", num_dianas))
+
+(caracteristics_ppi_ALZ[caracteristics_ppi_ALZ$Therapeutic_Target == 1, "Gene"])
+```
+
+
+# 2. WGAN‑G y CTGAN.
+
+Repetimos los mismos modelos pero esta vez crearemos dianas terapéuticas sintéticas usando GANS. 
+
+**Los pasamos al entorno de Python**
+```{r}
+py$caracteristics_ppi_ALZ <- caracteristics_ppi_ALZ
+```
+
+## 2.1 WGAN‑GP
+Los WGAN con Gradient Penalty son más estables y cubren mejor colas pesadas, porque su función de pérdida está basada en la distancia de Wasserstein en lugar de la entropía cruzada:
+
+NOTA: Modificado de 
+<https://github.com/igul222/improved_wgan_training.git>
+<https://github.com/Zeleni9/pytorch-wgan/tree/e594e2eef7dbd82d6ad23e9442006f6aee08db6e/models>
+
+```{python}
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import RobustScaler
+import tensorflow as tf
+from tensorflow.keras import layers, optimizers
+from scipy.stats import ks_2samp
+import matplotlib.pyplot as plt
+
+# ------------------------------------------------------------------
+# 1. Preparación de los Datos
+# ------------------------------------------------------------------
+# Copiar el dataset original (y limpiar genes sintéticos si ya estaban)
+df_original_w = caracteristics_ppi_ALZ.copy()
+df_original_w = df_original_w[~df_original_w['Gene'].astype(str).str.contains("Synthetic_Gene_")]
+
+# Filtrar las filas correspondientes a la clase minoritaria (Therapeutic_Target == 1)
+df_minority = df_original_w[df_original_w['Therapeutic_Target'] == 1].copy()
+
+# Seleccionar solo las columnas de características (excluye 'Therapeutic_Target' y 'Gene')
+feature_columns = [c for c in df_minority.columns if c not in ['Therapeutic_Target', 'Gene']]
+
+# Lista de variables con colas pesadas (distribución sesgada) que requieren transformación logarítmica
+heavy_tail = ['Degree','Degree_Centrality','Eigenvector_Centrality','K.core','PageRank','Clustering_Coefficient','Num_Orthologs']
+
+# Crear una copia del DataFrame con solo las columnas numéricas seleccionadas
+X = df_minority[feature_columns].copy()
+
+# Aplicar logaritmo (log1p) para reducir la asimetría de las variables con cola pesada
+for col in heavy_tail:
+    X[col] = np.log1p(X[col])  # log1p(x) = log(1 + x), funciona incluso si x = 0
+
+# Escalar todas las características para que tengan media 0 y desviación estándar 1
+scaler = RobustScaler()
+X_scaled = scaler.fit_transform(X.values)
+
+# Guardar la dimensión de entrada (número de características) para usarla en modelos posteriores
+input_dim = X_scaled.shape[1]
+
+# ------------------------------------------------------------------
+# 2. Definir WGAN-GP con MMD en generator y mayor capacidad
+# ------------------------------------------------------------------
+
+# Dimensión del vector de ruido (input del generador)
+noise_dim = 16
+
+# Definición del generador: convierte ruido (noise) en datos sintéticos
+def build_generator(noise_dim, output_dim):
+    return tf.keras.Sequential([
+        layers.Dense(128, input_dim=noise_dim),     # Capa densa con 128 neuronas, entrada es el vector de ruido
+        layers.LeakyReLU(alpha=0.2),                # Activación Leaky ReLU para permitir gradiente en valores negativos
+        layers.BatchNormalization(),                # Normalización para estabilizar el entrenamiento
+
+        layers.Dense(256),                          # Segunda capa densa con mayor capacidad
+        layers.LeakyReLU(alpha=0.2),                # Activación Leaky ReLU
+        layers.BatchNormalization(),                # Nueva normalización
+
+        layers.Dense(output_dim, activation='linear')  # Capa de salida, produce un vector de dimensión `output_dim`
+                                      # activación lineal para datos continuos
+    ])
+
+# Definición del crítico (critic en WGAN, reemplaza al discriminador clásico)
+def build_critic(input_dim):
+    return tf.keras.Sequential([
+        layers.Dense(512, input_dim=input_dim),     # Capa densa con 512 neuronas, entrada es un vector real o generado
+        layers.LeakyReLU(alpha=0.2),                # Activación Leaky ReLU
+        layers.LayerNormalization(),                # Normalización por capa (mejor que BatchNorm en el critic)
+
+        layers.Dense(256),                          # Segunda capa intermedia
+        layers.LeakyReLU(alpha=0.2),                # Activación
+        layers.LayerNormalization(),                # Normalización por capa
+
+        layers.Dense(128),                          # Tercera capa con menor número de neuronas
+        layers.LeakyReLU(alpha=0.2),  # Activación
+
+        layers.Dense(1)               # Capa de salida: devuelve un escalar (critic score)
+                                      
+    ])
+
+# Instanciación del generador y el crítico
+generator = build_generator(noise_dim, input_dim)
+critic = build_critic(input_dim)
+
+# Optimizadores para ambos modelos
+# WGAN-GP típicamente usa el mismo learning rate para ambos
+g_optimizer = optimizers.Adam(1e-4)    # Optimizador del generador
+c_optimizer = optimizers.Adam(1e-4)    # Optimizador del crítico
+
+# WGAN-GP gradient penalty
+# Crucial para forzar que el crítico cumpla la restricción de Lipschitz, estabilizando el entrenamiento.
+
+def gradient_penalty(critic, real, fake):
+    batch = tf.shape(real)[0]                        # Tamaño del batch
+    alpha = tf.random.uniform([batch,1], 0.0, 1.0)   # Interpolación aleatoria entre real y fake
+    interp = real + alpha * (fake - real)            # Muestras interpoladas entre reales y generadas
+    with tf.GradientTape() as tape:
+        tape.watch(interp)                        # Observar la interpolación para calcular gradientes
+        pred = critic(interp)                     # Salida del crítico para las muestras interpoladas
+    grads = tape.gradient(pred, interp)           # Gradientes del output respecto a la interpolación
+    norm = tf.sqrt(tf.reduce_sum(tf.square(grads), axis=1)) # Normas L2 de los gradientes
+    return tf.reduce_mean((norm - 1.0)**2)        # Penaliza que la norma se aleje de 1
+
+# MMD (Maximum Mean Discrepancy): comparación de distribuciones
+# Mide cuánto se parecen las distribuciones reales y generadas. Penalización adicional en el generador
+
+def compute_mmd(x, y, sigma=1.0):
+    # Similaridad entre puntos de x
+    xx = tf.matmul(x, x, transpose_b=True)
+    x2 = tf.reduce_sum(tf.square(x), axis=1, keepdims=True)
+    x2_x2 = x2 + tf.transpose(x2) - 2*xx
+    
+    # Similaridad entre puntos de y
+    yy = tf.matmul(y, y, transpose_b=True)
+    y2 = tf.reduce_sum(tf.square(y), axis=1, keepdims=True)
+    y2_y2 = y2 + tf.transpose(y2) - 2*yy
+    
+    # Similaridad entre puntos de x e y
+    xy = tf.matmul(x, y, transpose_b=True)
+    x2_y2 = x2 + tf.transpose(y2) - 2*xy
+    
+    # Kernels RBF
+    k_xx = tf.exp(-x2_x2/(2*sigma**2))
+    k_yy = tf.exp(-y2_y2/(2*sigma**2))
+    k_xy = tf.exp(-x2_y2/(2*sigma**2))
+    
+    # MMD = distancia entre medias de kernels
+    return tf.reduce_mean(k_xx) + tf.reduce_mean(k_yy) - 2*tf.reduce_mean(k_xy)
+
+# Peso del término MMD en la pérdida del generador
+lambda_mmd = 1.5 
+
+# Entrenamiento del CRÍTICO
+# Va a tratar de distinguir bien entre datos reales y generados, mientras cumple la restricción de Lipschitz junto a la penalización de gradiente.
+
+@tf.function                 # Compila para rendimiento
+def train_critic(real_batch):
+    noise = tf.random.normal([batch_size, noise_dim])  # Ruido aleatorio para el generador
+    with tf.GradientTape() as tape:
+        fake = generator(noise, training=True)         # Genera muestras falsas
+        real_out = critic(real_batch, training=True)   # Evalúa muestras reales
+        fake_out = critic(fake, training=True)         # Evalúa muestras falsas
+        gp = gradient_penalty(critic, real_batch, fake) # Calcula penalización de gradiente
+        
+        # Pérdida del crítico: diferencia Wasserstein + penalización
+        loss = tf.reduce_mean(fake_out) - tf.reduce_mean(real_out) + 10.0 * gp
+    
+    grads = tape.gradient(loss, critic.trainable_variables)  # Gradientes de la pérdida
+    c_optimizer.apply_gradients(zip(grads, critic.trainable_variables)) # Actualiza el crítico
+    return loss
+
+# Entrenamiento del GENERADOR
+# Se entrena para engañar al crítico y generar muestras con distribución similar a los datos reales (gracias al término MMD).
+
+@tf.function
+def train_generator(real_batch):
+    noise = tf.random.normal([batch_size, noise_dim])  # Ruido para generar muestras
+    with tf.GradientTape() as tape:
+        fake = generator(noise, training=True)  # Muestras sintéticas
+        fake_out = critic(fake, training=True)  # Crítico evalúa las falsas
+        wass_loss = -tf.reduce_mean(fake_out) # Pérdida Wasserstein (el generador quiere maximizarla)
+        mmd = compute_mmd(real_batch, fake)   # MMD entre datos reales y sintéticos
+        loss = wass_loss + lambda_mmd * mmd   # Pérdida total: Wasserstein + penalización MMD
+    grads = tape.gradient(loss, generator.trainable_variables)  # Gradientes
+    g_optimizer.apply_gradients(zip(grads, generator.trainable_variables)) # Actualiza el generador
+    return loss 
+
+# ------------------------------------------------------------------------------
+# 3. Entrenamiento con 10 (o más) pasos del crítico por cada paso del generador
+# ------------------------------------------------------------------------------
+#Entrenar el crítico más veces por ciclo ayuda a mejorar la estimación de la distancia Wasserstein antes de actualizar al generador.
+
+epochs = 2500
+batch_size = 5   # Tamaño del minibatch
+critic_steps = 70 # Número de pasos del crítico por cada paso del generador (mayor estabilidad)
+X_train = tf.constant(X_scaled, dtype=tf.float32) # Convertimos los datos reales a tensores de tipo float32
+
+# Bucle de entrenamiento
+for epoch in range(epochs):
+  # Entrenamos el crítico varias veces por cada época
+    for _ in range(critic_steps):
+      # Selección aleatoria de índices del batch
+        idx = tf.random.uniform([batch_size], 0, X_scaled.shape[0], dtype=tf.int32)
+      # Obtenemos un minibatch de muestras reales
+        real_batch = tf.gather(X_train, idx)
+      # Entrenamiento del crítico con este batch
+        c_loss = train_critic(real_batch)
+      # Entrenamiento del generador (una vez por época)
+    g_loss = train_generator(real_batch)
+    
+    # Mostrar progreso cada 500 épocas
+    if epoch % 500 == 0:
+        print(f"Epoch {epoch}: critic_loss={c_loss:.4f}, gen_loss={g_loss:.4f}")
+
+# ------------------------------------------------------------------
+# 4. Generar nuevas muestras y concatenar (igual que antes)
+# ------------------------------------------------------------------
+
+# Cálculo del número de muestras sintéticas necesarias para lograr una proporción r de clase minoritaria
+total0 = len(df_original_w)   # Total de muestras actuales
+minority0 = int(df_original_w['Therapeutic_Target'].sum())  # Número de muestras minoritarias
+r = 1/3                                     # La clase minoritaria representará el 33%
+n_synthetic = max(int(np.ceil((r*total0 - minority0)/(1-r))), 0) # Fórmula para calcular el número necesario
+print(f"Generando {n_synthetic} sintéticos...")
+
+# Generar ruido aleatorio como input para el generador
+noise = tf.random.normal([n_synthetic, noise_dim])
+
+# Obtener las características escaladas generadas
+gen_scaled = generator(noise, training=False).numpy()
+
+# Revertir el escalado (StandardScaler inverso → valores originales con log1p)
+gen_log = scaler.inverse_transform(gen_scaled)
+
+# Convertir a DataFrame
+gen_df = pd.DataFrame(gen_log, columns=feature_columns)
+
+# Revertir log1p a valores originales en heavy_tail
+for col in heavy_tail:
+    gen_df[col] = np.expm1(gen_df[col])
+
+gen_df['Therapeutic_Target'] = 1  # Etiquetar como clase minoritaria
+gen_df['Gene'] = [f"Synthetic_Gene_{i+1}" for i in range(n_synthetic)] # Nombres únicos de los genes sintéticos
+
+# Asegurar orden de columnas igual al DataFrame original
+gen_df = gen_df[df_original_w.columns]
+
+# Concatenar con el dataset original
+caracteristics_ppi_ALZ_augmented_WGAN_GP = pd.concat([df_original_w, gen_df], ignore_index=True)
+#caracteristics_ppi_ALZ_augmented_WGAN_GP.to_excel("caracteristics_ppi_ALZ_augmented.xlsx", index=False)
+
+print("Proceso completo: datos aumentados y guardados.")
+
+```
+
+
+## 2.2 CTGAN
+
+<https://docs.sdv.dev/sdv/single-table-data/data-preparation/creating-metadata>
+
+<https://colab.research.google.com/drive/15iom9fO8j_gHg4-NlGkzWF5thMWStXwv?usp=sharing#scrollTo=BZdrAOvmFRIn>
+
+<https://pypi.org/project/ctgan/>
+
+<https://www.kaggle.com/code/lucamassaron/how-to-use-ctgan-to-generate-more-data>
+
+**CTGAN con log1p aplicado. Aplicado a LAS DOS CLASES (0 y 1)**
+```{python eval=FALSE, include=FALSE}
+import pandas as pd
+import numpy as np
+import os
+from sdv.single_table import CTGANSynthesizer
+from sdv.metadata import SingleTableMetadata
+
+# Para evitar errores de multiproceso en Windows
+os.environ["JOBLIB_START_METHOD"] = "threading"
+
+# ------------------------------------------------------------------
+# 1. Construcción del dataset de entrenamiento
+# ------------------------------------------------------------------
+
+# Todos los ejemplos de clase 1
+df_class1 = caracteristics_ppi_ALZ[caracteristics_ppi_ALZ['Therapeutic_Target'] == 1]
+
+# Submuestreo de clase 0 (ej. 3000 ejemplos)
+df_class0_sampled = caracteristics_ppi_ALZ[caracteristics_ppi_ALZ['Therapeutic_Target'] == 0]\
+                    .sample(n=100, random_state=42)
+
+# Concatenar para formar el conjunto de entrenamiento balanceado
+df_train = pd.concat([df_class1, df_class0_sampled], ignore_index=True)
+
+# ------------------------------------------------------------------
+# 2. Preprocesamiento (log1p en variables con colas pesadas)
+# ------------------------------------------------------------------
+
+df_train = df_train.copy() # Copia del DataFrame de entrenamiento
+
+# Lista de variables con colas largas o valores extremos
+heavy_tail = ['Degree', 'Degree_Centrality', 'Eigenvector_Centrality', 'K.core',
+              'PageRank', 'Clustering_Coefficient', 'Num_Orthologs']
+
+for col in heavy_tail: # Para cada variable
+    df_train[col] = np.log1p(df_train[col])   # Se aplica la transformación log
+
+# Eliminar columna 'Gene'
+df_ctgan = df_train.drop(columns=['Gene'])
+df_ctgan['Therapeutic_Target'] = df_ctgan['Therapeutic_Target'].astype(str) # convertir la clase a string para ser tratada como categórica
+
+# ------------------------------------------------------------------
+# 3. Crear metadatos
+# ------------------------------------------------------------------
+
+# Crea un objeto vacío de tipo SingleTableMetadata (estructura que describe los tipos de columnas del dataset)
+metadata = SingleTableMetadata()
+
+# Detecta automáticamente los tipos de columnas (numérica, categórica, etc.) a partir del DataFrame de entrada
+metadata.detect_from_dataframe(df_ctgan)
+
+# Asegurar explícitamente que la columna 'Therapeutic_Target' es 'categorical'
+# Esto es necesario para que luego CTGAN permita condicionar la generación en base a esta variable
+metadata.update_column('Therapeutic_Target', sdtype='categorical')
+
+# ------------------------------------------------------------------
+# 4. Configurar modelo CTGAN (más ligero y estable)
+# ------------------------------------------------------------------
+
+ctgan = CTGANSynthesizer(
+    metadata=metadata,               # Objeto Metadata que describe las variables del dataset
+    enforce_rounding=True,           # Fuerza el redondeo automático en columnas numéricas si es necesario
+    embedding_dim=256,               # dimensión del espacio latente
+    generator_dim=(1024, 512, 256),  # tamaño de capas del generador
+    discriminator_dim=(1024, 512),   # tamaño de capas del discriminador
+    discriminator_steps=5,           # WGAN-GP: más pasos de crítico → mejor convergencia
+    generator_lr=2e-4,               # learning rate estándar de generador
+    generator_decay=1e-6,            # weight decay generador ligero
+    discriminator_lr=2e-4,           # learning rate crítico estándar
+    discriminator_decay=1e-6,        # weight decay crítico estándar
+    batch_size=128,                  # tamaño de lote acorde al número de muestras
+    epochs=800,                      # número de épocas
+    pac=16,                          # A mayor pac, penalización de gradiente más estable.
+    cuda=False,                      # False para CPU, True para GPU
+    verbose=True)                    # mostrar barra de progreso
+
+# Entrenar modelo
+ctgan.fit(df_ctgan)
+
+
+# ------------------------------------------------------------------
+# 5. Muestrear en bucle hasta obtener suficientes genes de clase 1
+# ------------------------------------------------------------------
+
+n_target = 500000  # Número deseado de genes de clase 1
+
+# Generar directamente usando condiciones
+synth = ctgan.sample(num_rows=n_target)
+
+# Mostrar cuántas filas de clase positiva se han generado
+n_positive = (synth['Therapeutic_Target'] == "1").sum()
+print(f"Se han generado {n_positive} genes sintéticos de clase 1.")
+
+# ------------------------------------------------------------------
+# 6. Postprocesamiento y combinación
+# ------------------------------------------------------------------
+
+# Etiquetar genes sintéticos
+synth['Gene'] = [f"Synthetic_Gene_{i+1}" for i in range(len(synth))]
+
+# Invertir transformación log1p
+for col in heavy_tail:
+    synth[col] = np.expm1(synth[col])
+
+# Reordenar columnas como en el dataset original
+synth = synth[caracteristics_ppi_ALZ.columns]
+
+# Concatenar con los datos reales
+df_aug_ctgan = pd.concat([caracteristics_ppi_ALZ, synth], ignore_index=True)
+
+print("Proceso completado. Datos aumentados listos para análisis.")
+
+
+```
+
+No se han usado todos los datos de clase 0, el proceso usa más ram de la disponible y mata silenciosamente el proceso: error `TerminatedWorkerError`. 
+
+Aún así, hay muy poca representación de la clase positiva y el modelo no puede capturar sus características, no devolviendo ninguna representación de esta, por lo que se procede a realizar CTGAN solo para esta clase (1).
+
+
+**CTGAN con log1p aplicado. Aplicado a LA CLASE POSITIVA (1)**
+```{python}
+import pandas as pd
+import numpy as np
+from sdv.single_table import CTGANSynthesizer
+from sdv.metadata import Metadata
+
+# ------------------------------------------------------------------
+# 1. Preparación de los Datos y Construir el objeto de metadatos para SDV
+# ------------------------------------------------------------------
+
+# Copiar dataset original 
+df_original = caracteristics_ppi_ALZ.copy()
+
+# Eliminar genes sintéticos si ya existen en el DataFrame original
+df_original = df_original[~df_original['Gene'].astype(str).str.contains("Synthetic_Gene_")]
+
+# Filtrar la clase minoritaria
+df_minority = df_original[df_original['Therapeutic_Target'] == 1].copy()
+
+# Variables con colas pesadas: aplicar transformación log1p
+heavy_tail = ['Degree', 'Degree_Centrality', 'Eigenvector_Centrality', 'K.core',
+              'PageRank', 'Clustering_Coefficient', 'Num_Orthologs']
+for col in heavy_tail:
+    df_minority[col] = np.log1p(df_minority[col])
+
+# Seleccionar columnas para CTGAN (sin 'Gene' ni 'Therapeutic_Target')
+feature_columns = [c for c in df_minority.columns if c not in ['Therapeutic_Target', 'Gene']]
+df_ctgan = df_minority[feature_columns + ['Therapeutic_Target']].reset_index(drop=True)
+
+
+# ------------------------------------------------------------------
+# 2. Crear los metadatos para SDV
+# ------------------------------------------------------------------
+metadata = SingleTableMetadata()
+metadata = Metadata.detect_from_dataframe(
+  data=df_ctgan)
+
+
+# ------------------------------------------------------------------
+# 3) Instanciar y configurar el sintetizador CTGAN
+# ------------------------------------------------------------------
+ctgan = CTGANSynthesizer(
+    metadata=metadata,               # Objeto Metadata que describe las variables del dataset
+    enforce_rounding=True,           # Fuerza el redondeo automático en columnas numéricas si es necesario
+    embedding_dim=64,               # dimensión del espacio latente
+    generator_dim=(128, 64),  # tamaño de capas del generador
+    discriminator_dim=(128, 64),   # tamaño de capas del discriminador
+    discriminator_steps=10,           # WGAN-GP: más pasos de crítico → mejor convergencia
+    generator_lr=1e-4,               # learning rate estándar de generador
+    generator_decay=1e-6,            # weight decay generador ligero
+    discriminator_lr=1e-4,           # learning rate crítico estándar
+    discriminator_decay=1e-6,        # weight decay crítico estándar
+    batch_size=8,                  # tamaño de lote acorde al número de muestras
+    epochs=3000,                      # número de épocas
+    pac=2,                          # A mayor pac, penalización de gradiente más estable.
+    cuda=True,                       # False para CPU, True para GPU
+    verbose=True)                     # mostrar barra de progreso
+
+#  Ajustar el modelo CTGAN a todos los datos
+ctgan.fit(df_ctgan)
+
+# ------------------------------------------------------------------
+# 4) Calcular cuántas filas sintéticas de clase 1 necesitamos 
+# ------------------------------------------------------------------
+
+total = len(df_original)
+minoría = int(df_original['Therapeutic_Target'].sum())
+r = 1/3
+n_synth = max(int(np.ceil((r * total - minoría) / (1 - r))), 0)
+print(f"Generaremos {n_synth} filas sintéticas de la clase minoritaria.")
+
+# ------------------------------------------------------------------
+# 5) Muestrear sólo las filas con Therapeutic_Target = 1 
+# ------------------------------------------------------------------
+
+# Argumentos `condition_column` y `condition_value` en lugar de `conditions`
+synth = ctgan.sample(
+    num_rows=n_synth)
+
+# Comprobación de que la etiqueta esté correcta
+synth['Therapeutic_Target'] = 1
+
+# Asignar nombres de gen sintético
+synth['Gene'] = [f"Synthetic_Gene_{i+1}" for i in range(n_synth)]
+
+# Invertir la transformación log1p
+for col in heavy_tail:
+    synth[col] = np.expm1(synth[col])
+
+# Reindexar columnas para que coincidan con el DataFrame original
+synth = synth[df_original.columns]
+
+# ------------------------------------------------------------------
+# 6) Concatenar con el DataFrame original
+# ------------------------------------------------------------------
+
+df_aug_ctgan = pd.concat([df_original, synth], ignore_index=True)
+
+#df_aumentado.to_excel("df_ppi_ctgan_sdv.xlsx", index=False)
+print("Proceso completado: datos sintéticos generados y guardados.")
+
+```
+
+
+
+
+
+**Diagnóstico de los datos sintéticos con el paquete `sdv`**
+
+Asegurar que los datos son válidos: 
+- Las llaves primarias son únicas
+- Valores continuos se ad
+```{python}
+import pandas as pd
+import numpy as np
+from sdv.single_table import CTGANSynthesizer
+from sdv.metadata.single_table import SingleTableMetadata
+from sdv.evaluation.single_table import run_diagnostic
+
+# Conjunto real de la clase minoritaria:
+real_data = caracteristics_ppi_ALZ[caracteristics_ppi_ALZ['Therapeutic_Target'] == 1] \
+                .reset_index(drop=True)      # Restableciendo el índice por precaución
+
+real_data = real_data.drop(columns=['Gene', 'Therapeutic_Target'])
+
+# Conjunto sintético, generado por ctgan.sample(...)
+synthetic_data = synth.reset_index(drop=True)
+
+# ------------------------------------------------------------------
+# 1) Ejecutar el diagnóstico
+# ------------------------------------------------------------------
+diagnostic = run_diagnostic(
+    real_data=real_data,
+    synthetic_data=synthetic_data,
+    metadata=metadata
+)
+
+
+```
+<https://colab.research.google.com/drive/15iom9fO8j_gHg4-NlGkzWF5thMWStXwv?usp=sharing#scrollTo=BZdrAOvmFRIn>
+
+```{python}
+from sdv.evaluation.single_table import evaluate_quality
+from sdv.metadata import Metadata
+
+
+# 1. Preparación de los DataFrames de evaluación, quitando 'Gene'
+
+#   `real_data`    : DataFrame con las muestras reales
+#   `synthetic_data`: DataFrame con las muestras sintéticas
+
+real_eval  = real_data.drop(columns=['Gene', 'Therapeutic_Target'], errors='ignore')
+synth_eval = synthetic_data.drop(columns=['Gene', 'Therapeutic_Target'], errors='ignore')
+
+# 2. Reconstrucción del metadata SOBRE LOS datos “limpios”
+
+# Detectamos el esquema directamente en el DataFrame sin 'Gene'
+metadata_eval = Metadata.detect_from_dataframe(
+    data=real_eval,
+    table_name='ppi_target'
+)
+
+
+# 3. Llamar a evaluate_quality con los DataFrames y el metadata nuevo
+
+quality_report = evaluate_quality(
+    real_data=real_eval,
+    synthetic_data=synth_eval,
+    metadata=metadata_eval
+)
+
+# 4. Resultado
+
+print("Informe de calidad de los datos sintéticos vs reales:\n")
+print(quality_report)
+
+```
+
+
+
+
+# 3 Evaluación de las dianas terapéuticas simuladas con GAN
+
+<https://www.analyticsvidhya.com/blog/2021/04/generate-your-own-dataset-using-gan/>
+
+## 3.1 WGAN‑GP
+### a) Comparación de las Distribuciones 
+
+#### Entre la Clase Diana Terapéutica y Diana No terapéutica  
+
+```{r}
+library(reticulate)
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+# Importar el objeto Python desde el entorno compartido
+df_aug_wgan <- py$caracteristics_ppi_ALZ_augmented_WGAN_GP
+
+# Convertir a factor Therapeutic_Target
+df_aug_wgan$Therapeutic_Target <- as.factor(df_aug_wgan$Therapeutic_Target)
+
+# Convertir a formato largo, excluyendo 'Gene'
+df_long_wgan <- df_aug_wgan %>%
+  select(-Gene) %>%
+  pivot_longer(cols = -Therapeutic_Target, names_to = "Metric", values_to = "Value")
+
+# Gráfico normal (sin escala logaritmica)
+ggplot(df_long_wgan, aes(x = Value, fill = Therapeutic_Target)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~ Metric, scales = "free") +
+  theme_minimal() +
+  ggtitle("WGAN-GP: Distribuciones Clase Diana Terapéutica vs No diana terapéutica")
+
+
+# Gráfico log
+(g_wgan_DT_NODT <- ggplot(df_long_wgan, aes(x = Value, fill = Therapeutic_Target)) +
+  geom_density(alpha = 0.5) +                # Curvas de densidad suavizadas para cada grupo
+  facet_wrap(~ Metric, scales = "free") +    # Panel separado para cada métrica
+  scale_x_log10() +                          # Aplicar escala logarítmica
+  theme_minimal() +
+  ggtitle("WGAN-GP: Distribuciones Clase Diana Terapéutica vs No diana terapéutica"))
+
+# Guardar
+#ggsave("Figuras_tfm/WGAN_DT_NODT.png", plot = g_wgan_DT_NODT, width = 8, height = 6, dpi = 300)
+
+
+```
+
+
+Test KS entre clase 0 y clase 1 en `df_aug_wgan`
+```{python}
+from scipy.stats import ks_2samp
+
+df_aug_wgan = caracteristics_ppi_ALZ_augmented_WGAN_GP.copy()
+
+# Seleccionar clases 0 y 1
+class_0 = df_aug_wgan[df_aug_wgan['Therapeutic_Target'] == 0]
+class_1 = df_aug_wgan[df_aug_wgan['Therapeutic_Target'] == 1]
+
+print("\nKS-test clase 0 vs clase 1 (WGAN-GP):")
+for col in feature_columns:
+    vals_0 = class_0[col].values
+    vals_1 = class_1[col].values
+    stat, p = ks_2samp(vals_0, vals_1)
+    print(f"{col}: KS p-value = {p:.3f}")
+
+```
+
+#### Entre Dianas Terapéuticas Reales vs Sintéticas.
+
+```{python}
+from scipy.stats import ks_2samp # Importar función para test de Kolmogorov-Smirnov
+
+print("\nKS-test real vs sintético:")
+
+# Itera sobre cada columna numérica para comparar su distribución en datos reales vs. sintéticos
+for col in feature_columns:
+    stat, p = ks_2samp(         # Aplica el test KS para la columna actual
+      df_minority[col].values,  # Valores reales (clase minoritaria)
+      gen_df[col].values)       # Valores sintéticos generados para esa clase
+      
+    # Imprime el valor p del test
+    print(f"{col}: KS p-value = {p:.3f}")
+```
+
+
+```{r}
+library(ggplot2)    
+library(dplyr)      
+library(tidyr)      
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(stringr)
+
+# Crear subconjunto directamente desde df_aug_wgan con etiqueta de origen
+df_WGANGP_subset <- df_aug_wgan %>%
+  filter(Therapeutic_Target == 1) %>%  # Solo dianas terapéuticas
+  mutate(Source = if_else(str_starts(Gene, "Synthetic_Gene_"),
+                          "WGAN-GP", "Real"))  # Etiquetar según prefijo del nombre
+
+# Eliminar columna 'Gene' (no necesaria para graficar)
+df_WGANGP_subset <- df_WGANGP_subset %>%
+  select(-Gene) %>%
+  mutate(Therapeutic_Target = as.factor(Therapeutic_Target))  # Asegurar formato factor
+
+# Convertir a formato largo para graficar varias métricas a la vez
+df_long_wgan_real <- df_WGANGP_subset %>%
+  pivot_longer(
+    cols = -c(Therapeutic_Target, Source),   # Mantener fijos estos campos
+    names_to = "Feature",                    # Nombre de cada métrica
+    values_to = "Value"                      # Valor numérico asociado
+  )
+
+# Crear gráfico de densidades con escala logarítmica
+(g_wgan_Real_log <- ggplot(df_long_wgan_real, aes(x = Value, fill = Source)) +
+  geom_density(alpha = 0.5) +                  # Curvas de densidad con transparencia
+  facet_wrap(~ Feature, scales = "free") +     # Un panel por métrica con su propia escala
+  scale_x_log10() +                            # Escala logarítmica en eje X
+  theme_minimal() +                            # Tema gráfico limpio
+  ggtitle("WGAN-GP: Distribuciones entre genes reales vs sintéticos (escala log)"))
+
+# Guardar el gráfico como archivo PNG
+ggsave(
+  filename = "Figuras_tfm/WGAN_Real_log.png",  # Ruta de guardado
+  plot = g_wgan_Real_log,                      # Gráfico a guardar
+  width = 8, height = 6, dpi = 300             # Tamaño y resolución del gráfico
+)
+
+
+```
+
+
+
+### b) Test multivariado Para comprobar correlaciones conjuntas,
+```{r}
+# Filtrar genes diana reales y sintéticos
+real_corr <- df_aug_wgan %>%
+  filter(Therapeutic_Target == 1 & !grepl("Synthetic", Gene)) %>%
+  select(where(is.numeric)) %>%
+  cor()
+
+synth_corr <- df_aug_wgan %>%
+  filter(Therapeutic_Target == 1 & grepl("Synthetic", Gene)) %>%
+  select(where(is.numeric)) %>%
+  cor()
+
+# Diferencia absoluta
+diff_corr <- abs(real_corr - synth_corr)
+
+# Sumar todas las diferencias (opcionalmente calcular norma Frobenius)
+(norm_diff <- sqrt(sum((real_corr - synth_corr)^2)))
+```
+
+```{python}
+import matplotlib.pyplot as plt
+
+# 1. Seleccionar columnas de características
+feature_columns = [c for c in df_minority.columns if c not in ['Therapeutic_Target', 'Gene']]
+
+# 2. Calcular matrices de correlación para reales y sintéticos
+corr_real = df_minority[feature_columns].corr()
+corr_synth = gen_df[feature_columns].corr()
+
+# 3. Calcular diferencia absoluta y su promedio
+diff_corr = np.abs(corr_real - corr_synth)
+mean_diff_corr = diff_corr.mean().mean()
+
+print("Promedio de diferencia de correlación (WGAN-GP):", round(mean_diff_corr, 4))
+
+
+```
+
+
+
+#### c) Análisis 3D de Componentes Principales 
+```{r}
+library(plotly)
+
+# Extraer solo las columnas numéricas (las métricas topológicas)
+df_pca_numeric <- df_WGANGP_subset %>%
+  select(where(is.numeric))  # Excluye 'Gene' y 'Source'
+
+# Escalar los datos (media 0, varianza 1)
+df_pca_scaled <- scale(df_pca_numeric)
+
+# Calcular PCA
+pca_model <- prcomp(df_pca_scaled, center = TRUE, scale. = TRUE)
+
+# Crear data frame con las 3 primeras componentes principales
+pca_df <- as.data.frame(pca_model$x[, 1:3])  # PC1, PC2, PC3
+
+# Añadir columna de origen ("Real" o "WGAN-GP")
+pca_df$Source <- df_WGANGP_subset$Source
+
+# Añadir tamaño del punto para destacar genes reales
+pca_df$size <- ifelse(pca_df$Source == "Real", 20, 5)
+
+# Crear gráfico 3D interactivo
+fig <- plot_ly(
+  data = pca_df,
+  x = ~PC1, y = ~PC2, z = ~PC3,           # Componentes principales
+  color = ~Source,                        # Colorear según origen
+  colors = c("red", "blue"),              # Rojo = real, azul = sintético
+  marker = list(
+    size = ~size,                         # Tamaño de puntos personalizado
+    line = list(width = 1, color = "black")  # Borde negro para mejor visibilidad
+  )
+) %>%
+  layout(
+    title = "PCA 3D: Dianas reales vs sintéticas (WGAN-GP)",  # Título
+    scene = list(
+      xaxis = list(title = "PC1"),
+      yaxis = list(title = "PC2"),
+      zaxis = list(title = "PC3")
+    )
+  )
+
+# Mostrar el gráfico en el visor
+fig
+
+
+```
+
+
+## 3.1 CTGAN‑GP
+
+### a) Comparación de las Distribuciones 
+
+#### Comparación entre clases: Dianas terapéuticas vs no dianas (dentro del conjunto generado por CTGAN)
+
+```{r}
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+# Importar el objeto Python como data frame de R
+df_aug_ctgan <- py$df_aug_ctgan
+
+# Convertir a factor Therapeutic_Target
+df_aug_ctgan$Therapeutic_Target <- as.factor(df_aug_ctgan$Therapeutic_Target)
+
+# Convertir a formato largo excluyendo la variable objetivo y 'Gene'
+df_long_ctgan <- df_aug_ctgan %>%
+  select(-Gene) %>%
+  pivot_longer(cols = -Therapeutic_Target, names_to = "Metric", values_to = "Value")
+
+# Gráfico en escala normal
+ggplot(df_long_ctgan, aes(x = Value, fill = Therapeutic_Target)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~ Metric, scales = "free") +
+  theme_minimal() +
+  ggtitle("CTGAN: Distribuciones Clase Diana Terapéutica vs No diana terapéutica")
+
+# Gráfico en escala logarítmica
+(g_ctgan_DT_NODT <- ggplot(df_long_ctgan, aes(x = Value, fill = Therapeutic_Target)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~ Metric, scales = "free") +
+  scale_x_log10() +
+  theme_minimal() +
+  ggtitle("CTGAN: Distribuciones Clase Diana Terapéutica vs No diana terapéutica (escala log)"))
+
+# Exportar
+#ggsave("Figuras_tfm/Ctgan_DT_NODT.png", plot = g_ctgan_DT_NODT, width = 8, height = 6, dpi = 300)
+
+```
+
+Test KS: clase 0 vs clase 1 dentro de df_aug_ctgan
+```{python}
+print("\nKS-test clase 0 vs clase 1 (df_aug_ctgan):")
+
+class0 = df_aug_ctgan[df_aug_ctgan['Therapeutic_Target'] == 0]
+class1 = df_aug_ctgan[df_aug_ctgan['Therapeutic_Target'] == 1]
+
+for col in feature_columns:
+    vals_0 = class0[col].values
+    vals_1 = class1[col].values
+    stat, p_value = ks_2samp(vals_0, vals_1)
+    print(f"{col}: KS p-value = {p_value:.3f}")
+
+```
+
+
+#### Comparación entre genes diana reales vs generados por CTGAN
+
+Test KS: Reales vs Sinteticos
+```{python}
+from scipy.stats import ks_2samp
+
+# Separar genes reales y sintéticos (ambos clase 1)
+real_eval = df_aug_ctgan[(df_aug_ctgan['Therapeutic_Target'] == 1) & (~df_aug_ctgan['Gene'].str.startswith("Synthetic_Gene_"))]
+synth_eval = df_aug_ctgan[(df_aug_ctgan['Therapeutic_Target'] == 1) & (df_aug_ctgan['Gene'].str.startswith("Synthetic_Gene_"))]
+
+print("\nKS-test real vs sintético (CTGAN):")
+for col in feature_columns:
+    real_vals = real_eval[col].values
+    synth_vals = synth_eval[col].values
+    stat, p_value = ks_2samp(real_vals, synth_vals)
+    print(f"{col}: KS p-value = {p_value:.3f}")
+
+
+```
+
+Gráfico Reales vs Sinteticos (CTGAN)
+```{r}
+# Preparar datos reales y CTGAN sólo de la clase positiva
+df_real <- caracteristics_ppi_ALZ %>%
+  filter(Therapeutic_Target == 1) %>%
+  mutate(Source = "Real",
+         Therapeutic_Target = as.factor(Therapeutic_Target)) %>%
+  select(-Gene)
+
+df_ctgan <- df_aug_ctgan %>%
+  filter(Therapeutic_Target == 1) %>%
+  mutate(Source = "CTGAN",
+         Therapeutic_Target = as.factor(Therapeutic_Target)) %>%
+  select(-Gene)
+
+# Unir los conjuntos
+df_combined_ctgan <- bind_rows(df_real, df_ctgan)
+
+# Convertir a formato largo
+df_long_ctgan_real <- df_combined_ctgan %>%
+  pivot_longer(cols = -c(Therapeutic_Target, Source), names_to = "Feature", values_to = "Value")
+
+# Graficar con escala logarítmica
+(g_ctgan_Real <- ggplot(df_long_ctgan_real, aes(x = Value, fill = Source)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~ Feature, scales = "free") +
+  scale_x_log10() +
+  theme_minimal() +
+  ggtitle("CTGAN: Distribuciones entre genes reales vs sintéticos (escala log)"))
+
+# Exportar
+#ggsave("Figuras_tfm/Ctgan_Real.png", plot = g_ctgan_Real, width = 8, height = 6, dpi = 300)
+```
+
+
+
+
+
+### b) Test multivariado Para comprobar correlaciones conjuntas
+```{r}
+# Filtrar genes diana reales y sintéticos
+real_corr <- df_aug_ctgan %>%
+  filter(Therapeutic_Target == 1 & !grepl("Synthetic", Gene)) %>%
+  select(where(is.numeric)) %>%
+  cor()
+
+synth_corr <- df_aug_ctgan %>%
+  filter(Therapeutic_Target == 1 & grepl("Synthetic", Gene)) %>%
+  select(where(is.numeric)) %>%
+  cor()
+
+# Diferencia absoluta
+diff_corr <- abs(real_corr - synth_corr)
+
+# Sumar todas las diferencias (opcionalmente calcular norma Frobenius)
+(norm_diff <- sqrt(sum((real_corr - synth_corr)^2)))
+
+```
+
+```{python}
+import matplotlib.pyplot as plt
+
+# Matrices de correlación
+corr_real = df_original[feature_columns].corr()
+corr_synth = synth[feature_columns].corr()
+
+# Diferencia absoluta promedio
+diff_corr = np.abs(corr_real - corr_synth)
+print("Promedio de diferencia de correlación (CTGAN):", diff_corr.mean().mean())
+
+```
+
+
+
+### c) Análisis de 3 PC 
+```{r}
+library(dplyr)
+library(plotly)
+library(stringr)
+
+# Cargar el DataFrame aumentado
+df_ctgan <- py$df_aug_ctgan
+
+# Filtrar solo las dianas terapéuticas (Therapeutic_Target == 1)
+df_ctgan_mayor <- df_ctgan %>% filter(Therapeutic_Target == 1)
+
+# Marcar origen según el prefijo en 'Gene'
+df_ctgan_mayor <- df_ctgan_mayor %>%
+  mutate(Source = if_else(str_starts(Gene, "Synthetic_Gene_"),
+                          "Synthetic (CTGAN)",
+                          "Real"))
+
+# Eliminar la columna Gene y convertir Target a factor
+df_ctgan_mayor <- df_ctgan_mayor %>%
+  select(-Gene) %>%
+  mutate(Therapeutic_Target = as.factor(Therapeutic_Target))
+
+# Extraer solo las columnas numéricas para PCA
+df_pca <- df_ctgan_mayor %>% select(where(is.numeric))
+
+# Escalar
+df_pca_scaled <- scale(df_pca)
+
+# PCA
+pca_model <- prcomp(df_pca_scaled, center = TRUE, scale. = TRUE)
+
+# Crear data.frame con coordenadas y etiquetas
+pca_df <- as.data.frame(pca_model$x[,1:3])
+pca_df$Source <- df_ctgan_mayor$Source
+# Ajustar tamaño para visualizar mejor
+pca_df$size <- ifelse(pca_df$Source == "Real", 10, 5)
+
+# Gráfico 3D interactivo
+fig <- plot_ly(pca_df,
+               x = ~PC1, y = ~PC2, z = ~PC3,
+               color = ~Source,
+               colors = c("red", "blue"),
+               marker = list(size = pca_df$size,
+                             line = list(width = 1, color = "black"))
+) %>%
+  layout(title = "PCA 3D: Reales vs Sintéticas (CTGAN)",
+         scene = list(xaxis = list(title = "PC1"),
+                      yaxis = list(title = "PC2"),
+                      zaxis = list(title = "PC3")))
+
+# Mostrar
+fig
+
+
+```
+
+
+# 4. Modelos ML Supervisados Para WGAN_GP
+
+## 4.1 Conjunto de Entrenamiento y Prueba
+```{r}
+# 1. Cargar librerías
+library(caret)
+
+# 2. Asegurarse de que la etiqueta es factor
+df_aug_wgan$Therapeutic_Target <- as.factor(df_aug_wgan$Therapeutic_Target)
+
+# 3. Crear partición entrenamiento/prueba (70/30)
+set.seed(42)
+train_idx <- createDataPartition(df_aug_wgan$Therapeutic_Target, p = 0.7, list = FALSE)
+
+# 4. Preparar conjuntos sin la columna 'Gene'
+feature_cols <- setdiff(names(df_aug_wgan), "Gene")
+df_train <- df_aug_wgan[train_idx, feature_cols]
+df_test  <- df_aug_wgan[-train_idx, feature_cols]
+
+# 5. Asegurar que la etiqueta es factor con nombres legibles
+df_train$Therapeutic_Target <- factor(df_train$Therapeutic_Target, 
+                                      levels = c(0, 1), 
+                                      labels = c("Class_0", "Class_1"))
+
+df_test$Therapeutic_Target <- factor(df_test$Therapeutic_Target, 
+                                     levels = c(0, 1), 
+                                     labels = c("Class_0", "Class_1"))
+```
+
+
+## 4.2 Random Forest
+```{r}
+# 1. Cargar librerías
+library(caret)
+library(randomForest)
+
+# 2. Entrenar Random Forest
+rf_model <- randomForest(
+  Therapeutic_Target ~ .,
+  data       = df_train,
+  ntree      = 100,
+  mtry       = 3,
+  importance = TRUE
+)
+
+# 3. Ver resumen del modelo
+print(rf_model)
+varImpPlot(rf_model)  # Importancias de variable
+
+# 4. Predecir en el conjunto de prueba
+rf_pred <- predict(rf_model, newdata = df_test)
+
+# 5. Matriz de confusión y métricas
+conf_matrix <- confusionMatrix(rf_pred, df_test$Therapeutic_Target)
+print(conf_matrix)
+```
+
+Exportar el modelo.
+```{r}
+# 6. Crear la carpeta si no existe
+if (!dir.exists("Gans_Models")) {
+  dir.create("Gans_Models")
+}
+
+# 7. Guardar el modelo en archivo RDS
+saveRDS(rf_model, file = "Gans_Models/rf_model_WganGp.rds")
+
+```
+
+
+
+## 4.3 Árbol de Decisión
+
+```{r eval=FALSE, include=FALSE}
+# 1. Cargar librerías
+library(rpart)
+library(rpart.plot)
+library(caret)
+
+# 2. Entrenar el Decision Tree en el conjunto de entrenamiento
+dt_model <- rpart(
+  Therapeutic_Target ~ .,
+  data    = df_train,
+  method  = "class",
+  control = rpart.control(minsplit = 20)
+)
+
+# 3. Mostrar el modelo entrenado
+print(dt_model)
+
+# 4. Graficar el árbol de decisión
+rpart.plot(
+  dt_model,
+  type          = 3,    # tipo de plot
+  extra         = 101,  # mostrar clases y porcentajes
+  fallen.leaves = TRUE
+)
+
+# 5. Predecir en el conjunto de prueba
+dt_pred <- predict(
+  dt_model,
+  newdata = df_test,
+  type    = "class"
+)
+
+# 6. Matriz de confusión y métricas
+conf_matrix_dt <- confusionMatrix(
+  dt_pred,
+  df_test$Therapeutic_Target,
+  positive = "1"
+)
+print(conf_matrix_dt)
+```
+
+**Usando el paquete `caret`.**
+```{r}
+# 1. Cargar librerías necesarias
+library(caret)
+library(C50)
+library(kernlab)
+
+# 2. Fijar semilla para reproducibilidad
+set.seed(123)
+
+# 3. Definir control para el entrenamiento (validación cruzada)
+ctrl <- trainControl(
+  method = "cv",              # Validación cruzada
+  number = 10,                # 10 pliegues
+  selectionFunction = "oneSE" # Selecciona el modelo más simple dentro de 1 std. error del mejor
+)
+
+# 4. Definición de la malla de hiperparámetros para C5.0
+grid <- expand.grid(
+  .model = "tree", 
+  .trials = c(1, 5, 10, 15, 20, 25, 30, 35), 
+  .winnow = "FALSE"
+)
+
+# 5. Entrenamiento del modelo con caret::train
+(dt_model_2 <- train(
+  Therapeutic_Target ~ .,         # Fórmula: todas las variables predicen Therapeutic_Target
+  data = df_train,                # Datos de entrenamiento
+  method = "C5.0",                # Algoritmo C5.0
+  metric = "Kappa",               # Métrica para optimizar
+  trControl = ctrl,              # Control de validación cruzada
+  tuneGrid = grid                # Malla de hiperparámetros
+))
+
+# 6. Predecir en el conjunto de prueba
+dt_pred <- predict(
+  dt_model_2,
+  newdata = df_test
+)
+
+# 7. Matriz de confusión y métricas
+conf_matrix_dt <- confusionMatrix(
+  dt_pred,
+  df_test$Therapeutic_Target,
+  positive = "Class_1"
+)
+print(conf_matrix_dt)
+
+```
+
+
+```{r}
+# 8. Crear la carpeta si no existe
+if (!dir.exists("Gans_Models")) {
+  dir.create("Gans_Models")
+}
+
+# 9. Guardar el modelo entrenado como archivo RDS
+saveRDS(dt_model_2, file = "Gans_Models/dt_model_WganGp.rds")
+
+```
+
+
+## 4.4 Modelo GCN
+
+### 4.4.1 Importamos el archivo obtenido de Biogrid con las interacciones.
+```{python}
+import pandas as pd
+
+# Cargar el archivo
+df_interactions = pd.read_csv(r"C:\Users\juanm\Desktop\MASTER_BIOINFORMATICA\0_TFM_Bioinf\TFM_Resultados\BIOGRID-PROJECT-alzheimers_disease_project-LATEST\INTERACTIONS_BIOGRID_PROJECT_alzheimers_disease_project.txt", sep="\t", 
+low_memory=False) # Evitar problemas de memoria
+ 
+# Primeras filas
+df_interactions.head()
+df_interactions.shape
+```
+
+### 4.4.2 Filtrado de las columnas necesarias para generar el grafo
+NOTA: Se han filtrado las interacciones genéticas, seleccionando solo las físicas. 
+
+```{python}
+# Filtrar solo interacciones físicas
+df_ppi = df_interactions[df_interactions["Experimental System Type"] == "physical"] # No interesan interacciones genéticas
+
+# Seleccionar solo columnas clave
+df_ppi = df_ppi[["Official Symbol Interactor A", "Official Symbol Interactor B"]]
+
+# Eliminar duplicados
+df_ppi = df_ppi.drop_duplicates()
+
+# Eliminar self-loops para simplificar el grafo
+df_ppi = df_ppi[df_ppi["Official Symbol Interactor A"] != df_ppi["Official Symbol Interactor B"]]
+
+
+# Mostrar las primeras filas
+df_ppi.head()
+
+```
+
+### 4.4.3 Preparación de los datos
+
+Esta vez el dataframe con las características ya contiene los nombres de los genes sintéticos con la estructura `Synthetic_Gene_` + índice.
+
+**Comprobaciones de que se ha realizado correctamente**
+```{r}
+# Contar cuántos genes reales (no empiezan por "Synthetic_") y cuántos sintéticos hay
+table(grepl("^Synthetic_Gene_", df_aug_wgan$Gene))
+
+# Resumen más legible
+gene_assignment_summary <- df_aug_wgan %>%
+  mutate(Gen_Type = ifelse(grepl("^Synthetic_Gene_", Gene), "Synthetic", "Real")) %>%
+  count(Gen_Type)
+
+print(gene_assignment_summary)
+
+```
+
+
+Se han asignado correctamente los nombres.
+```{r}
+# Filtrar las filas del gen "x"
+df_mapt <- caracteristics_ppi_ALZ %>% filter(Gene == "CTSD")
+
+df_mapt_WGAN_GP <- df_aug_wgan %>% filter(Gene == "CTSD")
+
+# Ver las primeras filas del dataframe filtrado
+head(df_mapt)
+head(df_mapt_WGAN_GP)
+
+```
+
+
+#### Creación de las nuevas conexiones entre genes sintéticos y reales usando KNN (Grafo combinado).
+```{r}
+library(FNN)
+library(dplyr)
+
+# 1. Separar genes sintéticos (nombres que empiezan con "Synthetic_Gene_")
+genes_sinteticos <- df_aug_wgan %>% 
+  filter(grepl("^Synthetic_Gene_", Gene))  # Filtra filas donde 'Gene' comienza con "Synthetic_Gene_"
+
+genes_reales <- df_aug_wgan %>% 
+  filter(!grepl("^Synthetic_Gene_", Gene)) # Filtra las que NO son sintéticas (genes reales)
+
+# 2. Seleccionar y escalar features
+features <- setdiff(names(df_aug_wgan), c("Gene", "Therapeutic_Target")) # Excluye columnas no numéricas
+
+X_real <- scale(genes_reales[, features]) # Escala los datos reales (media = 0, sd = 1)
+
+# Usar los mismos parámetros de escalado para los sintéticos
+X_sint <- scale(
+  genes_sinteticos[, features],
+  center = attr(X_real, "scaled:center"),  # Usa la misma media que los reales
+  scale = attr(X_real, "scaled:scale")     # Usa la misma desviación estándar
+)
+
+# 3. Aplicar KNN desde sintéticos hacia reales
+k <- 5                                          # Número de vecinos más cercanos
+knn_result <- get.knnx(X_real, X_sint, k = k)   # Encuentra los k vecinos reales más cercanos a cada sintético
+
+# 4. Crear nuevas interacciones: cada sintético se conecta con k genes reales
+source_genes <- rep(genes_sinteticos$Gene, each = k) # Repite cada gen sintético k veces
+target_indices <- as.vector(knn_result$nn.index)     # Índices de los vecinos reales
+target_genes <- genes_reales$Gene[target_indices]    # Nombres de los genes reales correspondientes
+
+new_edges <- data.frame(
+  Source = source_genes,     # Nodo fuente: gene sintético
+  Target = target_genes,     # Nodo destino: gene real
+  type = "synthetic",        # Tipo de interacción
+  stringsAsFactors = FALSE
+)
+
+# 5. Limpiar duplicados simétricos solo en las nuevas interacciones
+new_edges_clean <- new_edges %>%
+  filter(Source != Target) %>%                     # Elimina autoconexiones (gene con sí mismo)
+  mutate(Node1 = pmin(Source, Target),             # Ordena alfabéticamente los pares
+         Node2 = pmax(Source, Target)) %>%
+  distinct(Node1, Node2, .keep_all = TRUE) %>%    # Elimina duplicados tipo A-B y B-A
+  select(Source = Node1, Target = Node2, type)    # Renombra columnas al formato original
+
+# 6. Etiquetar interacciones originales (renombramos las columnas del PPI)
+df_original_edges <- py$df_ppi %>%       # Accede al DataFrame de interacciones original desde Python
+  rename(Source = `Official Symbol Interactor A`,       # Renombra para que coincida con el nuevo formato
+         Target = `Official Symbol Interactor B`) %>%
+  filter(Source != Target) %>%                         # Elimina autoconexiones
+  mutate(type = "original")                            # Etiqueta estas interacciones como originales
+
+# 7. Combinar ambos conjuntos
+df_ppi_combined <- bind_rows(df_original_edges, new_edges_clean)
+
+# 8. Ver resumen
+cat("Interacciones originales:", nrow(df_original_edges), "\n")
+cat("Nuevas interacciones limpias:", nrow(new_edges_clean), "\n")
+cat("Total de interacciones en el grafo combinado:", nrow(df_ppi_combined), "\n")
+
+```
+
+**Revisar número de duplicados exactos (Source + Target)**
+```{r}
+duplicated_rows <- duplicated(df_ppi_combined[, c("Source", "Target")])
+sum(duplicated_rows)
+```
+
+**Los pasamos al entorno de Python**
+```{r}
+py$df_ppi_combined <- df_ppi_combined
+py$df_aug_wgan <- df_aug_wgan
+```
+
+
+**Visualización del grafo combinado**
+```{python}
+import networkx as nx
+import matplotlib.pyplot as plt
+
+# Crear el grafo desde el DataFrame
+G = nx.from_pandas_edgelist(df_ppi_combined, "Source", "Target")
+
+# Calcular el grado de cada nodo
+node_degree = dict(G.degree())
+
+# Seleccionar los 100 nodos más conectados
+top_nodes = sorted(node_degree, key=node_degree.get, reverse=True)[:100]
+
+# Crear un subgrafo con estos nodos
+G_sub = G.subgraph(top_nodes)
+
+# Usar un layout más expandido
+pos = nx.spring_layout(G_sub, k=2)  # k controla la dispersión de los nodos
+
+# Dibujar la red
+plt.figure(figsize=(16, 14))
+nx.draw(G_sub, pos, with_labels=False, node_size=40, edge_color="gray", alpha=0.6, width=0.5)
+
+# Identificar los nodos más conectados y etiquetarlos
+high_degree_nodes = [n for n, d in G_sub.degree() if d > 30]
+nx.draw_networkx_nodes(G_sub, pos, nodelist=high_degree_nodes, node_size=100, node_color="red")
+
+# Añadir etiquetas solo a los nodos clave
+labels = {n: n for n in high_degree_nodes}
+nx.draw_networkx_labels(G_sub, pos, labels, font_size=8, font_color="black")
+
+plt.title("Red PPI con los 300 nodos más conectados (mejor distribuida)")
+plt.show()
+
+```
+
+**Guardar la figura**
+```{python eval=FALSE, include=FALSE}
+import networkx as nx
+import matplotlib.pyplot as plt
+import os
+
+# Crear carpeta si no existe
+os.makedirs("Figuras_tfm", exist_ok=True)
+
+# Guardar la figura
+plt.savefig("Figuras_tfm/redPPI_Wgan_GP.png", dpi=300, bbox_inches='tight')
+```
+
+
+### 4.4.4 Creación del Modelo GCN
+
+#### 4.4.4.1. Preparación de los Nodos (x) y Etiquetas (y)
+
+Instalar CUDA y pytorch: 
+<https://docs.nvidia.com/cuda/cuda-quick-start-guide/index.html>
+<https://pytorch.org/get-started/locally/#windows-pip>
+
+```{python}
+import pandas as pd
+import torch
+from torch_geometric.data import Data
+from sklearn.preprocessing import StandardScaler
+
+# - df_ppi_combined: con columnas "Source", "Target" y "type"
+# - df_aug_wgan: con las columnas de métricas, "Gene" y "Therapeutic_Target".
+#
+# Nota: df_aug_wgan incluye tanto genes reales como genes sintéticos (por WGAN_GP),
+
+# 1. Crear un conjunto con los nombres de genes presentes en df_aug_wgan
+valid_genes = set(df_aug_wgan["Gene"])
+
+# 2. Filtrar el dataframe de aristas para incluir solo aquellas aristas cuyos extremos estén en valid_genes.
+df_edges_filtered = df_ppi_combined[
+    df_ppi_combined["Source"].isin(valid_genes) & df_ppi_combined["Target"].isin(valid_genes)
+].copy()
+
+# 3. Crear un diccionario que asigna un índice único a cada gen (para representarlo como nodo en la GNN)
+gene2idx = {gene: idx for idx, gene in enumerate(df_aug_wgan["Gene"])}
+
+# Diccionario inverso: de índice a nombre de gen (útil para interpretar resultados luego)
+idx2gene = {idx: gene for gene, idx in gene2idx.items()}
+
+# 4. Convertir los nombres de genes en las columnas Source y Target a índices usando gene2idx
+df_edges_filtered["Source"] = df_edges_filtered["Source"].map(gene2idx)
+df_edges_filtered["Target"] = df_edges_filtered["Target"].map(gene2idx)
+
+# Verificación: si algún gen no fue encontrado (resultado NaN), se lanza un error para alertar del problema
+if df_edges_filtered["Source"].isna().any() or df_edges_filtered["Target"].isna().any():
+    raise ValueError("Algunos genes de las aristas no se encontraron en df_aug_wgan.")
+
+# 5. Construir edge_index, una matriz de 2 x num_aristas con los índices de los nodos conectados
+edge_index = torch.tensor(df_edges_filtered[['Source', 'Target']].values.T, dtype=torch.long)
+
+# 6. Seleccionar todas las columnas numéricas (features) excepto las identificadoras
+feature_cols = [col for col in df_aug_wgan.columns if col not in ["Gene", "Therapeutic_Target"]]
+
+# Comprobar que todas las columnas sean numéricas, forzando la conversión y deteniendo si hay errores
+for col in feature_cols:
+    # 'errors="raise"' forzará una excepción si algún valor no se puede convertir a número.
+    df_aug_wgan[col] = pd.to_numeric(df_aug_wgan[col], errors='raise')
+
+# Escalar las características a media 0 y varianza 1, lo cual mejora el entrenamiento de la GNN
+# Se espera que StandardScaler trabaje con arrays numéricos.
+scaler = StandardScaler()
+x_array = scaler.fit_transform(df_aug_wgan[feature_cols])
+
+# Convertir el array NumPy escalado a un tensor de PyTorch
+x = torch.tensor(x_array, dtype=torch.float)
+
+# 7. Crear el vector de etiquetas (y) a partir de la columna "Therapeutic_Target".
+# Convirtiendo las etiquetas (Therapeutic_Target) a números enteros y a tensor de PyTorch
+# Nos aseguramos de que la conversión a número se haga correctamente.
+y = torch.tensor(pd.to_numeric(df_aug_wgan["Therapeutic_Target"], errors='raise').values, dtype=torch.long)
+
+# 8. Crear el objeto `Data` de PyTorch Geometric que encapsula nodos (x), aristas (edge_index) y etiquetas (y)
+data = Data(x=x, edge_index=edge_index, y=y)
+
+# Estructura del objeto Data.
+print(data)
+
+
+```
+
+
+#### 4.4.4.2. Entrenamiento de un modelo GCN
+
+##### **Entrenamiento y Compilación del Modelo Sin Ajustar** 
+
+```{python}
+import torch
+import torch.nn.functional as F
+from torch_geometric.nn import GCNConv
+import numpy as np
+
+# -----------------------------------------------------------------------------
+# 1. Preparación: Crear subconjuntos de entrenamiento, validación y test
+# -----------------------------------------------------------------------------
+
+# 'data' es un objeto torch_geometric.data.Data con:
+# - data.x: matriz de características de dimensión [N x F]
+# - data.edge_index: tensor de aristas de tamaño [2 x E]
+# - data.y: vector de etiquetas (long), de tamaño [N]
+
+num_nodes = data.num_nodes      # Se obtiene el número total de nodos en el grafo (número de genes)
+
+indices = np.arange(num_nodes)  # Se crean índices secuenciales del 0 al num_nodes-1
+
+np.random.shuffle(indices)      # Se desordenan aleatoriamente los índices (para asegurar un split aleatorio)
+
+# 70% entrenamiento, 15% validación y 15% prueba
+train_size = int(0.7 * num_nodes)   # Número de nodos para el conjunto de entrenamiento (70%)
+val_size = int(0.15 * num_nodes)    # y para validación (15%)
+
+train_indices = indices[:train_size] # Primeros nodos aleatorios se asignan al conjunto de entrenamiento
+
+val_indices = indices[train_size:train_size + val_size] # Los siguientes al conjunto de validación
+
+test_indices = indices[train_size + val_size:] # Los restantes van al conjunto de prueba
+
+# Creamos máscaras booleanas para cada subconjunto
+
+# Se inicializan vectores booleanos de longitud igual al número de nodos, con todos los valores en False
+data.train_mask = torch.zeros(num_nodes, dtype=torch.bool)
+data.val_mask = torch.zeros(num_nodes, dtype=torch.bool)
+data.test_mask = torch.zeros(num_nodes, dtype=torch.bool)
+
+# Se establecen en True las posiciones correspondientes a los nodos de cada conjunto
+data.train_mask[train_indices] = True
+data.val_mask[val_indices] = True
+data.test_mask[test_indices] = True
+
+# -----------------------------------------------------------------------------
+# 2. Definición del modelo GCN
+# -----------------------------------------------------------------------------
+
+# Se define una clase GCN (Graph Convolutional Network), que hereda de torch.nn.Module
+class GCN(torch.nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels, dropout=0.5):
+        # Inicialización de la superclase
+        super(GCN, self).__init__()
+        # Primera capa de convolución sobre grafos (GCNConv)
+        self.conv1 = GCNConv(in_channels, hidden_channels)
+        # Segunda capa de convolución que reduce a la dimensión de salida
+        self.conv2 = GCNConv(hidden_channels, out_channels)
+        # Probabilidad de dropout entre capas
+        self.dropout = dropout
+
+    # Método forward: define cómo fluye la información por la red
+    def forward(self, x, edge_index):
+        # Aplicar la primera capa de convolución
+        x = self.conv1(x, edge_index)
+        # Activación ReLU
+        x = F.relu(x)
+        # Dropout durante el entrenamiento (no durante inferencia)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        # Segunda capa de convolución: produce los logits para cada clase
+        x = self.conv2(x, edge_index)
+        return x
+
+# Función auxiliar de predicción usando el modelo entrenado
+def predict(self, x, edge_index, threshold=0.5):
+    """
+    Realiza la inferencia, aplicando softmax y un umbral para obtener las predicciones finales.
+    :param x: Matriz de características (tensor de nodos).
+    :param edge_index: Matriz de adyacencia (formato COO, 2 x E).
+    :param threshold: Umbral de decisión para clasificar como clase 1.
+    :return: Predicciones binarizadas (0 o 1) por nodo.
+    """
+    # Poner el modelo en modo evaluación (desactiva dropout, batchnorm, etc.)
+    self.eval()
+    with torch.no_grad():
+        # Obtener los logits de salida del modelo (no normalizados)
+        logits = self.forward(x, edge_index)
+        # Aplicar softmax para convertir logits en probabilidades por clase
+        probabilities = torch.softmax(logits, dim=1)
+        # Extraer las probabilidades de la clase positiva (índice 1)
+        y_probs = probabilities[:, 1]
+        # Aplicar el umbral para convertir probabilidades en etiquetas (0 o 1)
+        predictions = (y_probs >= threshold).long()
+    return predictions
+
+# -----------------------------------------------------------------------------
+# 3. Configuración del entrenamiento
+# -----------------------------------------------------------------------------
+
+# Seleccionar el dispositivo de cómputo: si hay GPU disponible, usarla; si no, usar CPU
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Obtener el número de características (features) por nodo desde el objeto `data`
+in_channels = data.num_node_features   # Tamaño del vector de entrada para cada nodo
+
+# Definir el número de neuronas de la capa oculta (hiperparámetro)
+hidden_channels = 16                   
+
+# Salida del modelo: 2 clases (para clasificación binaria)
+out_channels = 2                       
+
+# Crear una instancia del modelo GCN con los parámetros definidos y moverlo al dispositivo (GPU o CPU)
+model_wgangp = GCN(in_channels, hidden_channels, out_channels, dropout=0.5).to(device)
+
+# También se transfiere el objeto de datos al mismo dispositivo (coherencia con entrenamiento)
+data = data.to(device)
+
+# Definir el optimizador: se usará Adam con un learning rate de 0.01 y L2 regularización (weight_decay)
+optimizer = torch.optim.Adam(model_wgangp.parameters(), lr=0.01, weight_decay=5e-4)
+
+# -----------------------------------------------------------------------------
+# 4. Funciones de entrenamiento y evaluación
+# -----------------------------------------------------------------------------
+
+# Función de entrenamiento para una época
+def train():
+    model_wgangp.train()  # Poner el modelo en modo entrenamiento
+    optimizer.zero_grad()  # Reiniciar los gradientes acumulados
+    out = model_wgangp(data.x, data.edge_index)  # Propagación hacia adelante (forward pass)
+
+    # Calcular la pérdida solo en los nodos de entrenamiento
+    loss = F.cross_entropy(
+        out[data.train_mask],           # Predicciones del modelo en nodos de entrenamiento
+        data.y[data.train_mask]         # Etiquetas verdaderas de los nodos de entrenamiento
+    )
+        
+    loss.backward()  # Calcular los gradientes mediante backpropagation
+    optimizer.step() # Actualizar los pesos del modelo
+    return loss.item()  # Devolver el valor numérico de la pérdida
+
+# Función para evaluar el modelo en los 3 conjuntos (train, val, test)
+def test():
+    model_wgangp.eval()  # Poner el modelo en modo evaluación (desactiva dropout, batchnorm...)
+    out = model_wgangp(data.x, data.edge_index)  # Propagación hacia adelante
+
+    # Seleccionar la clase con mayor probabilidad (logit más alto)
+    pred = out.argmax(dim=1)
+
+    accuracies = {}  # Diccionario para guardar las métricas por split
+
+    # Iterar sobre los tres conjuntos: train, val y test
+    for key, mask in zip(["Train", "Validation", "Test"], 
+                         [data.train_mask, data.val_mask, data.test_mask]):
+        # Calcular número de aciertos
+        correct = (pred[mask] == data.y[mask]).sum().item()
+        # Precisión = aciertos / total
+        acc = correct / mask.sum().item() if mask.sum().item() > 0 else 0
+        accuracies[key] = acc  # Guardar precisión por split
+
+    return accuracies  # Devolver diccionario con métricas
+
+# -----------------------------------------------------------------------------
+# 5. Ciclo de entrenamiento
+# -----------------------------------------------------------------------------
+
+num_epochs = 200  # Número total de épocas (iteraciones sobre los datos)
+
+# Bucle principal de entrenamiento
+for epoch in range(1, num_epochs + 1):
+    loss = train()     # Ejecutar una época de entrenamiento y obtener la pérdida
+    accs = test()      # Evaluar el modelo en train, validación y test
+
+    # Mostrar resultados cada 10 épocas
+    if epoch % 10 == 0:
+        print(f'Epoch: {epoch:03d}, Loss: {loss:.4f}, '
+              f'Train: {accs["Train"]:.4f}, Val: {accs["Validation"]:.4f}, Test: {accs["Test"]:.4f}')
+
+
+```
+
+##### **Métricas de Evaluación del Modelo GCN Sin Ajustar** 
+```{python}
+import numpy as np
+from sklearn.metrics import confusion_matrix, classification_report
+
+# Poner el modelo en modo evaluación
+model_wgangp.eval()  # Desactiva dropout y batchnorm para realizar inferencia estable
+
+# Realizamos la inferencia en todo el grafo
+out = model_wgangp(data.x, data.edge_index)  # Propaga la información por el grafo y genera logits
+
+# Convertir los logits a predicciones (la clase con el valor máximo)
+pred = out.argmax(dim=1).cpu().numpy()  # Selecciona la clase más probable y la convierte a numpy array
+
+# Extraer las etiquetas reales
+true = data.y.cpu().numpy()  # Extrae las etiquetas verdaderas del grafo como array
+
+# Si solo queremos evaluar en el conjunto de test, usamos la test_mask
+test_mask = data.test_mask.cpu().numpy()  # Máscara booleana que indica los nodos de test
+
+# Aplicamos la máscara de test
+pred_test = pred[test_mask]  # Filtra las predicciones para quedarse solo con las del conjunto de test
+true_test = true[test_mask]  # Filtra las etiquetas verdaderas solo para el test
+
+
+# Calcular la matriz de confusión
+conf_mat = confusion_matrix(true_test, pred_test)
+print("Matriz de Confusión:")
+print(conf_mat)
+
+# Obtener un reporte con precisión, recall, f1-score y más métricas
+report = classification_report(true_test, pred_test)
+print("\nReporte de Clasificación:")
+print(report)
+
+```
+
+
+##### Reajuste del Modelo
+Una vez ejecutados los dos siguientes pasos A y B, volver a entrenar y compilar el modelo ejecutando el código anterior.
+
+###### A) Búsqueda (grid search) de pesos para la función de pérdida
+```{python include=FALSE}
+import numpy as np
+import torch
+import torch.nn.functional as F
+from sklearn.metrics import f1_score
+
+# 1. Calcular pesos iniciales basados en la frecuencia de la clase en el conjunto de entrenamiento.
+# Extrae las etiquetas verdaderas de los nodos de entrenamiento y las convierte a array de NumPy
+train_labels = data.y[data.train_mask].cpu().numpy()
+
+# Utilizamos np.bincount para contar cuántas instancias hay de cada clase
+class_counts = np.bincount(train_labels)
+print("Recuento de clases en train:", class_counts)
+
+# Calcular pesos inversos a la frecuencia
+# A menor frecuencia de clase, mayor peso. Se invierte el conteo para penalizar más a la clase minoritaria
+initial_weights = 1.0 / class_counts.astype(np.float32)
+
+# Normalizar los pesos para que sumen 1
+initial_weights = initial_weights / initial_weights.sum()
+print("Pesos iniciales:", initial_weights)
+
+# 2. Definir una rejilla de multiplicadores para probar sobre los pesos iniciales
+multiplicadores = [0.5, 1.0, 2.0]
+
+# Variables para guardar el mejor resultado
+best_f1 = 0.0           # Inicializa el mejor F1-score encontrado
+best_weights = None     # Guardar los pesos que dieron ese mejor F1-score
+
+# Número de epochs para la validación en cada combinación
+num_epochs_validacion = 50
+
+# Grid search: se prueban todas las combinaciones de multiplicadores para clase 0 y clase 1.
+for m0 in multiplicadores:     # Recorre cada multiplicador para la clase 0
+    for m1 in multiplicadores: # Recorre cada multiplicador para la clase 1
+        # Calcular los pesos candidatos aplicando los multiplicadores a los pesos iniciales
+        candidate_weights = np.array([initial_weights[0] * m0, initial_weights[1] * m1], dtype=np.float32)
+        candidate_weights_tensor = torch.tensor(candidate_weights, dtype=torch.float, device=device)
+        
+        print(f"\nProbando multiplicadores => Clase 0: {m0}, Clase 1: {m1}")
+        print("Pesos candidatos:", candidate_weights)
+        
+        # Reinicializar el modelo y el optimizador para cada combinación de pesos
+        model_wgangp = GCN(in_channels, hidden_channels, out_channels, dropout=0.5).to(device)
+        optimizer = torch.optim.Adam(model_wgangp.parameters(), lr=0.01, weight_decay=5e-4)
+        
+        # Entrenar el modelo por un número fijo de épocas con los pesos actuales
+        for epoch in range(num_epochs_validacion):
+            model_wgangp.train()
+            optimizer.zero_grad()
+            out = model_wgangp(data.x, data.edge_index)  # Forward pass
+            
+            # Calcular la pérdida con pesos de clase aplicados
+            loss = F.cross_entropy(out[data.train_mask], data.y[data.train_mask], weight=candidate_weights_tensor)
+            loss.backward()   # Backpropagation
+            optimizer.step()  # Actualizar pesos del modelo
+        
+        # Evaluar el modelo entrenado en el conjunto de validación
+        model_wgangp.eval()
+        out = model_wgangp(data.x, data.edge_index)
+        pred = out.argmax(dim=1)                       # Obtener la clase predicha (logit máximo)
+        pred_val = pred[data.val_mask].cpu().numpy()   # Predicciones del set de validación
+        true_val = data.y[data.val_mask].cpu().numpy() # Etiquetas reales
+        
+        # Calcular el f1-score para la clase minoritaria (clase 1)
+        current_f1 = f1_score(true_val, pred_val, pos_label=1)
+        print(f"Multiplicadores ({m0}, {m1}) -> F1 (clase 1): {current_f1:.4f}")
+        
+        # Guardar los pesos si son los que dan mejor F1 hasta ahora
+        if current_f1 > best_f1:
+            best_f1 = current_f1
+            best_weights = candidate_weights_tensor
+
+print("\nMejores pesos encontrados:", best_weights, "con f1-score:", best_f1)
+
+```
+
+
+###### B) Refinar el umbral de decisión: 
+En lugar de asignar la clase 1 cuando la probabilidad es mayor o igual a 0.5 (que es el umbral por defecto cuando se toma el argmax de los logits), vamos a buscar un umbral alternativo que mejore la métrica f1-score para la clase de interés.
+```{python}
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.metrics import f1_score, precision_score, recall_score
+
+# 1. Poner el modelo en modo evaluación y obtener las probabilidades para cada nodo
+model_wgangp.eval()                              # Cambia el modelo a modo evaluación (desactiva dropout, etc.)
+with torch.no_grad():                   # No se almacenan los gradientes (reduce uso de memoria y computación)
+    out = model_wgangp(data.x, data.edge_index)  # Predicción del modelo sobre todo el grafo
+    probs = torch.softmax(out, dim=1)     # Convierte los logits a probabilidades con softmax
+
+# 2. Extraer las probabilidades para la clase positiva (clase 1)
+y_probs = probs[:, 1].cpu().numpy()  # Probabilidades predichas para la clase 1
+y_true = data.y.cpu().numpy()        # Etiquetas reales de todos los nodos
+
+# 3. Aplicar la máscara de validación para obtener solo los datos del conjunto de validación
+mask = data.val_mask.cpu().numpy()  # Máscara booleana para nodos de validación
+y_true_val = y_true[mask]           # Etiquetas reales del conjunto de validación
+y_probs_val = y_probs[mask]         # Probabilidades de clase 1 para validación
+
+# 4. Buscar el umbral óptimo variando de 0 a 1 (por ejemplo, en pasos de 0.01)
+thresholds = np.arange(0, 1.01, 0.01)  # Genera umbrales de decisión entre 0.00 y 1.00
+f1_scores = []                         # Lista para almacenar el F1-score de cada umbral
+precisions = []                        # Lista para almacenar la precisión de cada umbral
+recalls = []                           # Lista para almacenar el recall de cada umbral
+
+
+for t in thresholds:
+    # Predicción: se asigna clase 1 si la probabilidad es mayor o igual al umbral t
+    y_pred = (y_probs_val >= t).astype(int)
+    
+    # Calcular las métricas para este umbral
+    f1 = f1_score(y_true_val, y_pred, zero_division=0)           # F1-score: balance entre precisión y recall
+    precision = precision_score(y_true_val, y_pred, zero_division=0)  # Precisión: TP / (TP + FP)
+    recall = recall_score(y_true_val, y_pred, zero_division=0)        # Recall: TP / (TP + FN)
+    
+    # Guardar los resultados en listas para análisis posterior
+    f1_scores.append(f1)
+    precisions.append(precision)
+    recalls.append(recall)
+
+# 5. Encontrar el umbral que maximiza el F1-score (puedes usar precisión o recall si lo prefieres)
+best_index = np.argmax(f1_scores)               # Índice del mejor F1-score
+best_threshold = thresholds[best_index]         # Umbral correspondiente al mejor F1-score
+print(f"Mejor umbral: {best_threshold:.2f}")    # Mostrar umbral óptimo
+print(f"F1-score en validación: {f1_scores[best_index]:.4f}")  # F1-score óptimo
+print(f"Precisión: {precisions[best_index]:.4f}, Recall: {recalls[best_index]:.4f}")  # Métricas asociadas
+
+# 6. (Opcional) Graficar cómo varían las métricas con el umbral
+plt.figure(figsize=(10, 5))                      # Crear figura de tamaño adecuado
+plt.plot(thresholds, f1_scores, label='F1-score')        # Curva F1-score
+plt.plot(thresholds, precisions, label='Precisión')      # Curva de precisión
+plt.plot(thresholds, recalls, label='Recall')            # Curva de recall
+plt.xlabel("Umbral")                            # Etiqueta del eje X
+plt.ylabel("Métrica")                           # Etiqueta del eje Y
+plt.title("Curvas de F1, Precisión y Recall en función del umbral")  # Título del gráfico
+plt.legend()                                    # Mostrar leyenda
+plt.grid(True)                                  # Añadir rejilla
+plt.show()                                      # Mostrar gráfico
+
+```
+
+
+
+##### Volver a ejecutar el modelo ajustando pesos y umbral de decisión 
+```{python}
+import torch
+import torch.nn.functional as F
+from torch_geometric.nn import GCNConv
+import numpy as np
+
+# -----------------------------------------------------------------------------
+# 1. Preparación: Crear splits de entrenamiento, validación y test
+# -----------------------------------------------------------------------------
+
+# Se obtiene el número total de nodos en el grafo (número de genes)
+num_nodes = data.num_nodes
+
+# Se crean índices secuenciales del 0 al num_nodes-1
+indices = np.arange(num_nodes)
+
+# Se desordenan aleatoriamente los índices (para asegurar un split aleatorio)
+np.random.shuffle(indices)
+
+# División en conjuntos
+
+# Se calcula el número de nodos que irán al conjunto de entrenamiento (70%)
+train_size = int(0.7 * num_nodes)
+
+# Se calcula el número de nodos que irán al conjunto de validación (15%)
+val_size = int(0.15 * num_nodes)
+
+# Primeros nodos aleatorios se asignan al conjunto de entrenamiento
+train_indices = indices[:train_size]
+
+# Los siguientes se asignan al conjunto de validación
+val_indices = indices[train_size:train_size + val_size]
+
+# Los restantes van al conjunto de prueba
+test_indices = indices[train_size + val_size:]
+
+# Crear máscaras booleanas 
+
+# Se inicializan vectores booleanos de longitud igual al número de nodos, con todos los valores en False
+data.train_mask = torch.zeros(num_nodes, dtype=torch.bool)
+data.val_mask = torch.zeros(num_nodes, dtype=torch.bool)
+data.test_mask = torch.zeros(num_nodes, dtype=torch.bool)
+
+# Se establecen en True las posiciones correspondientes a los nodos de cada conjunto
+data.train_mask[train_indices] = True
+data.val_mask[val_indices] = True
+data.test_mask[test_indices] = True
+
+# -----------------------------------------------------------------------------
+# 2. Definición del modelo GCN
+# -----------------------------------------------------------------------------
+
+# Definimos una clase llamada GCN que hereda de torch.nn.Module
+class GCN(torch.nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels, dropout=0.5):
+        # Inicializamos la clase base (nn.Module)
+        super(GCN, self).__init__()
+        # Primera capa de convolución en grafos (GCNConv) de entrada a capa oculta
+        self.conv1 = GCNConv(in_channels, hidden_channels)
+        # Segunda capa de convolución, de oculta a salida
+        self.conv2 = GCNConv(hidden_channels, out_channels)
+        # Porcentaje de dropout que se aplicará después de la primera capa
+        self.dropout = dropout
+
+    def forward(self, x, edge_index):
+        # Propagación hacia adelante del modelo
+        # Aplicar la primera capa de convolución y función de activación ReLU
+        x = self.conv1(x, edge_index)
+        x = F.relu(x)
+        # Aplicar dropout solo en entrenamiento
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        # Segunda capa de convolución para producir los logits de salida
+        x = self.conv2(x, edge_index)
+        return x
+
+# Función auxiliar para hacer predicción usando un umbral explícito
+def predict(self, x, edge_index, threshold=best_threshold):
+        """
+        Realiza la inferencia con el modelo, aplicando softmax y un umbral para convertir
+        probabilidades en etiquetas de clase (0 o 1).
+        """
+        self.eval()  # Poner el modelo en modo evaluación (desactiva dropout, batchnorm, etc.)
+        with torch.no_grad():  # Desactiva el cálculo de gradientes (más eficiente)
+            # Ejecutar el modelo para obtener los logits
+            logits = self.forward(x, edge_index)
+            # Convertir los logits en probabilidades con softmax
+            probabilities = torch.softmax(logits, dim=1)
+            # Extraer la probabilidad de pertenencia a la clase 1 (positiva)
+            y_probs = probabilities[:, 1]
+            # Clasificar como 1 si la probabilidad es mayor o igual al umbral
+            predictions = (y_probs >= threshold).long()
+        return predictions
+
+
+# -----------------------------------------------------------------------------
+# 3. Configuración del entrenamiento
+# -----------------------------------------------------------------------------
+
+# Seleccionar el dispositivo para ejecutar el modelo:
+# Si hay una GPU disponible, se usará ('cuda'); si no, se usará CPU ('cpu').
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Obtener el número de características (features) de entrada desde el objeto `data`
+in_channels = data.num_node_features  # Dimensión de entrada del modelo GCN
+
+# Definir el número de unidades en la capa oculta
+hidden_channels = 16  
+
+# Definir el número de salidas (clases). Como es clasificación binaria, se usa 2.
+out_channels = 2
+
+# Instanciar el modelo GCN con los parámetros definidos y moverlo al dispositivo seleccionado (GPU o CPU)
+model_wgangp = GCN(in_channels, hidden_channels, out_channels, dropout=0.5).to(device)
+
+# Mover también los datos al dispositivo (para que modelo y datos estén en el mismo entorno de ejecución)
+data = data.to(device)
+
+# Definir el optimizador Adam con una tasa de aprendizaje de 0.01 y una penalización L2 (weight decay)
+# para evitar sobreajuste.
+optimizer = torch.optim.Adam(model_wgangp.parameters(), lr=0.01, weight_decay=5e-4)
+
+# -----------------------------------------------------------------------------
+# 4. Funciones de entrenamiento y evaluación
+# -----------------------------------------------------------------------------
+
+# Función para entrenar el modelo en una época
+def train():
+    model_wgangp.train()  # Pone el modelo en modo entrenamiento (activa dropout, etc.)
+    optimizer.zero_grad()  # Reinicia los gradientes acumulados
+    out = model_wgangp(data.x, data.edge_index)  # Propagación hacia adelante
+
+    # Cálculo de la función de pérdida solo en nodos de entrenamiento
+    # Se usa una versión ponderada de cross-entropy con los mejores pesos encontrados
+    loss = F.cross_entropy(out[data.train_mask], data.y[data.train_mask], weight=best_weights)
+    
+    loss.backward()      # Calcula los gradientes por backpropagation
+    optimizer.step()     # Actualiza los pesos del modelo con los gradientes
+    return loss.item()   # Devuelve el valor escalar de la pérdida
+
+# Función para evaluar el modelo en train, validation y test
+def test():
+    model_wgangp.eval()  # Pone el modelo en modo evaluación (desactiva dropout)
+    out = model_wgangp(data.x, data.edge_index)  # Forward pass para todo el grafo
+
+    pred = out.argmax(dim=1)  # Selecciona la clase con mayor probabilidad (logit más alto)
+    accuracies = {}
+
+    # Calcula la precisión (accuracy) en cada conjunto (train, val, test)
+    for key, mask in zip(["Train", "Validation", "Test"], 
+                         [data.train_mask, data.val_mask, data.test_mask]):
+        correct = (pred[mask] == data.y[mask]).sum().item()  # Cuántas predicciones correctas
+        acc = correct / mask.sum().item() if mask.sum().item() > 0 else 0  # Precisión
+        accuracies[key] = acc
+    return accuracies
+  
+# -----------------------------------------------------------------------------
+# 5. Ciclo de entrenamiento
+# -----------------------------------------------------------------------------
+
+num_epochs = 200  # Número total de épocas para entrenar
+
+# Bucle principal de entrenamiento
+for epoch in range(1, num_epochs + 1):
+    loss = train()    # Ejecuta una época de entrenamiento
+    accs = test()     # Evalúa el modelo en cada split (train, val, test)
+
+    # Cada 10 épocas, muestra la pérdida y precisiones
+    if epoch % 10 == 0:
+        print(f'Epoch: {epoch:03d}, Loss: {loss:.4f}, '
+              f'Train: {accs["Train"]:.4f}, Val: {accs["Validation"]:.4f}, Test: {accs["Test"]:.4f}')
+
+
+```
+
+
+#### 4.4.4.3. Métricas de Evaluación del Modelo GCN
+
+**Matriz de Confusión y Reporte de Clasificación**
+```{python}
+import numpy as np
+from sklearn.metrics import confusion_matrix, classification_report
+
+# Poner el modelo en modo evaluación
+model_wgangp.eval()
+# Realizamos la inferencia en todo el grafo
+out = model_wgangp(data.x, data.edge_index)
+# Convertir los logits a predicciones (la clase con el valor máximo)
+pred = out.argmax(dim=1).cpu().numpy()
+
+# Extraer las etiquetas reales
+true = data.y.cpu().numpy()
+
+# Si solo queremos evaluar en el conjunto de test, usamos la test_mask
+test_mask = data.test_mask.cpu().numpy()
+# Aplicamos la máscara de test
+pred_test = pred[test_mask]
+true_test = true[test_mask]
+
+# Calcular la matriz de confusión
+conf_mat = confusion_matrix(true_test, pred_test)
+print("Matriz de Confusión:")
+print(conf_mat)
+
+# Obtener un reporte con precisión, recall, f1-score y más métricas
+report = classification_report(true_test, pred_test)
+print("\nReporte de Clasificación:")
+print(report)
+
+```
+
+**Curvas ROC y Precision-Recall**
+```{python}
+import torch
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve, auc, precision_recall_curve, average_precision_score
+
+# 1. Evaluar el modelo y obtener las probabilidades en el conjunto de test
+model.eval()
+with torch.no_grad():
+    # Realizamos la inferencia en todo el grafo
+    out = model(data.x, data.edge_index)
+    # Convertimos los logits a probabilidades (softmax) para cada clase
+    probs = torch.softmax(out, dim=1)
+
+# Extraer las probabilidades de la clase 1 (diana terapéutica)
+y_scores = probs[:, 1].cpu().numpy()
+y_true = data.y.cpu().numpy()
+
+# Aplicar la máscara de test para obtener solo los valores correspondientes al conjunto de test
+test_mask = data.test_mask.cpu().numpy()
+y_true_test = y_true[test_mask]
+y_scores_test = y_scores[test_mask]
+
+# 2. Calcular la Curva ROC y el AUC
+fpr, tpr, thresholds = roc_curve(y_true_test, y_scores_test)
+roc_auc = auc(fpr, tpr)
+
+plt.figure()
+plt.plot(fpr, tpr, label=f'ROC Curve (AUC = {roc_auc:.2f})')
+plt.plot([0, 1], [0, 1], 'k--', label='Baseline')
+plt.xlabel('Tasa de Falsos Positivos')
+plt.ylabel('Tasa de Verdaderos Positivos (Recall)')
+plt.title('Curva ROC')
+plt.legend(loc='lower right')
+plt.show()
+
+# 3. Calcular la Curva Precision-Recall y el Average Precision Score
+precision, recall, thresholds_pr = precision_recall_curve(y_true_test, y_scores_test)
+avg_precision = average_precision_score(y_true_test, y_scores_test)
+
+plt.figure()
+plt.plot(recall, precision, label=f'Precision-Recall Curve (AP = {avg_precision:.2f})')
+plt.xlabel('Recall')
+plt.ylabel('Precision')
+plt.title('Curva Precision-Recall')
+plt.legend(loc='lower left')
+plt.show()
+
+```
+
+
+## 4.5 Exportar el Modelo GCN Entrenado
+```{python eval=FALSE, include=FALSE}
+import os
+import torch
+
+# Crear carpeta si no existe
+os.makedirs("Gans_Models", exist_ok=True)
+
+# Ruta de guardado
+model_path = "Gans_Models/gcn_model_WganGp.pth"
+
+# Guardar el modelo completo (estructura + pesos)
+torch.save(model_wgangp, model_path)
+
+print(f"Modelo completo guardado en: {model_path}")
+
+```
+
+# 5. Modelos ML Supervisados Para CTGAN
+
+## 5.0 Cargamos el Conjunto de Datos desde Python
+```{r}
+df_aug_ctgan <- py$df_aug_ctgan
+```
+
+## 5.1 Conjunto de Entrenamiento y Prueba
+```{r}
+# 1. Cargar librerías
+library(caret)
+
+# 2. Asegurarse de que la etiqueta es factor
+df_aug_ctgan$Therapeutic_Target <- as.factor(df_aug_ctgan$Therapeutic_Target)
+
+# 3. Crear partición entrenamiento/prueba (70/30)
+set.seed(42)
+train_idx <- createDataPartition(df_aug_ctgan$Therapeutic_Target, p = 0.7, list = FALSE)
+
+# 4. Preparar conjuntos sin la columna 'Gene'
+feature_cols <- setdiff(names(df_aug_ctgan), "Gene")
+df_train <- df_aug_ctgan[train_idx, feature_cols]
+df_test  <- df_aug_ctgan[-train_idx, feature_cols]
+
+# 5. Asegurar que la etiqueta es factor con nombres legibles
+df_train$Therapeutic_Target <- factor(df_train$Therapeutic_Target, 
+                                      levels = c(0, 1), 
+                                      labels = c("Class_0", "Class_1"))
+
+df_test$Therapeutic_Target <- factor(df_test$Therapeutic_Target, 
+                                     levels = c(0, 1), 
+                                     labels = c("Class_0", "Class_1"))
+```
+
+
+## 5.2 Random Forest
+```{r}
+# 1. Cargar librerías
+library(caret)
+library(randomForest)
+
+# 2. Entrenar Random Forest
+rf_model <- randomForest(
+  Therapeutic_Target ~ .,
+  data       = df_train,
+  ntree      = 100,
+  mtry       = 3,
+  importance = TRUE
+)
+
+# 3. Ver resumen del modelo
+print(rf_model)
+varImpPlot(rf_model)  # Importancias de variable
+
+# 4. Predecir en el conjunto de prueba
+rf_pred <- predict(rf_model, newdata = df_test)
+
+# 5. Matriz de confusión y métricas
+conf_matrix <- confusionMatrix(rf_pred, df_test$Therapeutic_Target)
+print(conf_matrix)
+```
+
+Exportar el modelo.
+```{r}
+# 6. Crear carpeta "Gans_Models" si no existe
+if (!dir.exists("Gans_Models")) {
+  dir.create("Gans_Models")
+}
+
+# 7. Guardar el modelo completo como RDS
+saveRDS(rf_model, file = "Gans_Models/rf_model_CTgan.rds")
+
+cat("Modelo Random Forest guardado en Gans_Models/rf_model.rds\n")
+```
+
+
+## 5.3 Árbol de Decisión
+
+```{r}
+# 1. Cargar librerías
+library(rpart)
+library(rpart.plot)
+library(caret)
+
+# 2. Asegurar que la etiqueta es factor (si no lo está ya)
+df_train$Therapeutic_Target <- as.factor(df_train$Therapeutic_Target)
+df_test$Therapeutic_Target  <- as.factor(df_test$Therapeutic_Target)
+
+# 3. Entrenar el Decision Tree en el conjunto de entrenamiento
+dt_model <- rpart(
+  Therapeutic_Target ~ .,
+  data    = df_train,
+  method  = "class",
+  control = rpart.control(minsplit = 20)
+)
+
+# 4. Mostrar el modelo entrenado
+print(dt_model)
+
+# 5. Graficar el árbol de decisión
+rpart.plot(
+  dt_model,
+  type          = 3,    # tipo de plot
+  extra         = 101,  # mostrar clases y porcentajes
+  fallen.leaves = TRUE
+)
+
+# 6. Predecir en el conjunto de prueba
+dt_pred <- predict(
+  dt_model,
+  newdata = df_test,
+  type    = "class"
+)
+
+# 7. Matriz de confusión y métricas
+conf_matrix_dt <- confusionMatrix(
+  dt_pred,
+  df_test$Therapeutic_Target,
+  positive = "1"
+)
+print(conf_matrix_dt)
+```
+**Usando el paquete `caret`.**
+```{r}
+# 1. Cargar librerías necesarias
+library(caret)
+library(C50)
+library(kernlab)
+
+# 2. Fijar semilla para reproducibilidad
+set.seed(123)
+
+# 3. Definir control para el entrenamiento (validación cruzada)
+ctrl <- trainControl(
+  method = "cv",              # Validación cruzada
+  number = 10,                # 10 pliegues
+  selectionFunction = "oneSE" # Selecciona el modelo más simple dentro de 1 std. error del mejor
+)
+
+# 4. Definición de la malla de hiperparámetros para C5.0
+grid <- expand.grid(
+  .model = "tree", 
+  .trials = c(1, 5, 10, 15, 20, 25, 30, 35), 
+  .winnow = "FALSE"
+)
+
+# 5. Entrenamiento del modelo con caret::train
+(dt_model_2 <- train(
+  Therapeutic_Target ~ .,         # Fórmula: todas las variables predicen Therapeutic_Target
+  data = df_train,                # Datos de entrenamiento
+  method = "C5.0",                # Algoritmo C5.0
+  metric = "Kappa",               # Métrica para optimizar
+  trControl = ctrl,              # Control de validación cruzada
+  tuneGrid = grid                # Malla de hiperparámetros
+))
+
+# 6. Predecir en el conjunto de prueba
+dt_pred <- predict(
+  dt_model_2,
+  newdata = df_test
+)
+
+# 7. Matriz de confusión y métricas
+conf_matrix_dt <- confusionMatrix(
+  dt_pred,
+  df_test$Therapeutic_Target,
+  positive = "Class_1"
+)
+print(conf_matrix_dt)
+
+```
+
+
+**Exportar el modelo.**
+```{r}
+# 8. Crear carpeta "Gans_Models" si no existe
+if (!dir.exists("Gans_Models")) {
+  dir.create("Gans_Models")
+}
+
+# 9. Guardar el modelo completo como RDS
+saveRDS(dt_model_2, file = "Gans_Models/dt_model_CTgan.rds")
+
+cat("Modelo Decision Tree guardado en Gans_Models/dt_model.rds\n")
+
+```
+
+
+## 5.4 Modelo GNN
+
+### 5.4.3 Preparación de los datos
+
+Esta vez el dataframe con las características ya contiene los nombres de los genes sintéticos con la estructura `Synthetic_Gene_` + índice.
+
+**Comprobaciones de que se ha realizado correctamente**
+```{r}
+# Contar cuántos genes reales (no empiezan por "Synthetic_") y cuántos sintéticos hay
+table(grepl("^Synthetic_Gene_", df_aug_ctgan$Gene))
+
+# Resumen más legible
+gene_assignment_summary <- df_aug_ctgan %>%
+  mutate(Gen_Type = ifelse(grepl("^Synthetic_Gene_", Gene), "Synthetic", "Real")) %>%
+  count(Gen_Type)
+
+print(gene_assignment_summary)
+
+```
+
+
+Se han asignado correctamente los nombres.
+```{r}
+# Filtrar las filas del gen "x"
+df_mapt <- caracteristics_ppi_ALZ %>% filter(Gene == "CTSD")
+
+df_mapt_WGAN_GP <- df_aug_ctgan %>% filter(Gene == "CTSD")
+
+# Ver las primeras filas del dataframe filtrado
+head(df_mapt)
+head(df_mapt_WGAN_GP)
+
+```
+
+
+**Creamos las nuevas conexiones entre genes sintéticos y reales usando KNN, para generar un nuevo grafo combinado.**
+```{r}
+library(FNN)      # Carga el paquete para realizar búsquedas de vecinos más cercanos (KNN)
+library(dplyr)    # Carga el paquete para manipulación de datos con sintaxis tipo pipe (%>%)
+
+# 1. Separar genes sintéticos (aquellos cuyo nombre empieza por "Synthetic_Gene_")
+genes_sinteticos <- df_aug_ctgan %>% 
+  filter(grepl("^Synthetic_Gene_", Gene))  # Selecciona filas donde 'Gene' empieza con "Synthetic_Gene_"
+
+genes_reales <- df_aug_ctgan %>% 
+  filter(!grepl("^Synthetic_Gene_", Gene)) # Selecciona filas donde 'Gene' **no** empieza con "Synthetic_Gene_"
+
+# 2. Seleccionar y escalar las columnas numéricas (features)
+features <- setdiff(names(df_aug_ctgan), c("Gene", "Therapeutic_Target"))  # Excluye columnas no numéricas
+
+X_real <- scale(genes_reales[, features])  # Escala los datos reales (media = 0, sd = 1)
+
+# Escala los datos sintéticos con los mismos parámetros que los reales (para mantener la coherencia)
+X_sint <- scale(
+  genes_sinteticos[, features],
+  center = attr(X_real, "scaled:center"),  # Usa la media de X_real
+  scale = attr(X_real, "scaled:scale")     # Usa la desviación estándar de X_real
+)
+
+# 3. Aplicar KNN: para cada vector sintético, buscar los k vecinos más cercanos entre los reales
+k <- 5
+knn_result <- get.knnx(X_real, X_sint, k = k)  # Devuelve los índices de los k vecinos más cercanos
+
+# 4. Crear nuevas interacciones: cada sintético se conecta con sus k vecinos reales
+source_genes <- rep(genes_sinteticos$Gene, each = k)       # Repite cada gen sintético k veces
+target_indices <- as.vector(knn_result$nn.index)           # Aplana la matriz de vecinos
+target_genes <- genes_reales$Gene[target_indices]          # Asocia los índices con nombres reales
+
+# Crea un data frame con las nuevas conexiones (edges)
+new_edges <- data.frame(
+  Source = source_genes,     # Nodo origen (sintético)
+  Target = target_genes,     # Nodo destino (real)
+  type = "synthetic",        # Etiqueta de tipo de interacción
+  stringsAsFactors = FALSE
+)
+
+# 5. Eliminar duplicados simétricos y autoconexiones
+new_edges_clean <- new_edges %>%
+  filter(Source != Target) %>%                    # Elimina conexiones de un nodo consigo mismo
+  mutate(Node1 = pmin(Source, Target),            # Asegura orden alfabético en cada par
+         Node2 = pmax(Source, Target)) %>%
+  distinct(Node1, Node2, .keep_all = TRUE) %>%    # Elimina duplicados simétricos (A-B == B-A)
+  select(Source = Node1, Target = Node2, type)    # Renombra columnas a formato original
+
+# 6. Cargar interacciones originales y etiquetarlas como "original"
+df_original_edges <- py$df_ppi %>%                           # Accede al dataframe Python desde R
+  rename(Source = `Official Symbol Interactor A`,            # Renombra columnas para homogeneidad
+         Target = `Official Symbol Interactor B`) %>%
+  filter(Source != Target) %>%                               # Elimina autoconexiones
+  mutate(type = "original")                                  # Añade etiqueta de tipo
+
+# 7. Combinar interacciones originales y sintéticas en un solo grafo
+df_ppi_combined <- bind_rows(df_original_edges, new_edges_clean)
+
+# 8. Mostrar resumen informativo
+cat("Interacciones originales:", nrow(df_original_edges), "\n")
+cat("Nuevas interacciones limpias:", nrow(new_edges_clean), "\n")
+cat("Total de interacciones en el grafo combinado:", nrow(df_ppi_combined), "\n")
+
+```
+
+
+**Revisar número de duplicados exactos (Source + Target)**
+```{r eval=FALSE, include=FALSE}
+duplicated_rows <- duplicated(df_ppi_combined[, c("Source", "Target")])
+sum(duplicated_rows)
+```
+
+**Los pasamos al entorno de Python**
+```{r}
+py$df_ppi_combined <- df_ppi_combined
+py$df_aug_ctgan <- df_aug_ctgan
+```
+
+
+**Visualización del grafo combinado**
+```{python}
+import networkx as nx
+import matplotlib.pyplot as plt
+
+# Crear el grafo desde el DataFrame
+G = nx.from_pandas_edgelist(df_ppi_combined, "Source", "Target")
+
+# Calcular el grado de cada nodo
+node_degree = dict(G.degree())
+
+# Seleccionar los 100 nodos más conectados
+top_nodes = sorted(node_degree, key=node_degree.get, reverse=True)[:100]
+
+# Crear un subgrafo con estos nodos
+G_sub = G.subgraph(top_nodes)
+
+# Usar un layout más expandido
+pos = nx.spring_layout(G_sub, k=2)  # k controla la dispersión de los nodos
+
+# Dibujar la red
+plt.figure(figsize=(16, 14))
+nx.draw(G_sub, pos, with_labels=False, node_size=40, edge_color="gray", alpha=0.6, width=0.5)
+
+# Identificar los nodos más conectados y etiquetarlos
+high_degree_nodes = [n for n, d in G_sub.degree() if d > 30]
+nx.draw_networkx_nodes(G_sub, pos, nodelist=high_degree_nodes, node_size=100, node_color="red")
+
+# Añadir etiquetas solo a los nodos clave
+labels = {n: n for n in high_degree_nodes}
+nx.draw_networkx_labels(G_sub, pos, labels, font_size=8, font_color="black")
+
+plt.title("Red PPI con los 300 nodos más conectados (mejor distribuida)")
+plt.show()
+
+```
+
+**Guardar la figura**
+```{python eval=FALSE, include=FALSE}
+import networkx as nx
+import matplotlib.pyplot as plt
+import os
+
+# Crear carpeta si no existe
+os.makedirs("Figuras_tfm", exist_ok=True)
+
+# Guardar la figura
+plt.savefig("Figuras_tfm/redPPI_CTGAN.png", dpi=300, bbox_inches='tight')
+```
+
+
+
+### 5.4.4 Creación del Modelo GNN
+
+#### 5.4.4.1. Preparación de los Nodos (x) y Etiquetas (y)
+
+Instalar CUDA y pytorch: 
+<https://docs.nvidia.com/cuda/cuda-quick-start-guide/index.html>
+
+
+```{python}
+import pandas as pd
+import torch
+from torch_geometric.data import Data
+from sklearn.preprocessing import StandardScaler
+
+# - df_ppi_combined: con columnas "Source", "Target" y "type"
+# - df_aug_ctgan: con las columnas de métricas, "Gene" y "Therapeutic_Target".
+
+# Nota: df_aug_ctgan incluye tanto genes reales como genes sintéticos (por WGAN_GP),
+
+# 1. Crear un conjunto con todos los genes válidos a partir del DataFrame aumentado (reales + sintéticos)
+valid_genes = set(df_aug_ctgan["Gene"])
+
+# 2. Filtrar solo aquellas interacciones PPI donde tanto el gen fuente como el destino estén en valid_genes
+df_edges_filtered = df_ppi_combined[
+    df_ppi_combined["Source"].isin(valid_genes) & df_ppi_combined["Target"].isin(valid_genes)
+].copy()
+
+# 3. Crear un diccionario para mapear cada gen a un índice numérico (para usar en PyTorch Geometric)
+gene2idx = {gene: idx for idx, gene in enumerate(df_aug_ctgan["Gene"])}
+# Y también su inverso (índice a gen) por si lo necesitas después
+idx2gene = {idx: gene for gene, idx in gene2idx.items()}
+
+# 4. Convertir los nombres de los genes en el dataframe de aristas a sus índices numéricos
+df_edges_filtered["Source"] = df_edges_filtered["Source"].map(gene2idx)
+df_edges_filtered["Target"] = df_edges_filtered["Target"].map(gene2idx)
+
+# Verifica si hay genes en las aristas que no están en el DataFrame de genes válidos (por si hubo un fallo de filtrado)
+if df_edges_filtered["Source"].isna().any() or df_edges_filtered["Target"].isna().any():
+    raise ValueError("Algunos genes de las aristas no se encontraron en df_aug_ctgan.")
+
+# 5. Crear edge_index: matriz 2xE que representa las conexiones en el grafo, lista para torch_geometric
+edge_index = torch.tensor(df_edges_filtered[['Source', 'Target']].values.T, dtype=torch.long)
+
+# 6. Crear la matriz de características x (input de la GNN)
+# Se seleccionan todas las columnas excepto las no numéricas
+feature_cols = [col for col in df_aug_ctgan.columns if col not in ["Gene", "Therapeutic_Target"]]
+
+# Asegurarse de que todos los valores en las columnas numéricas son numéricos
+for col in feature_cols:
+    df_aug_ctgan[col] = pd.to_numeric(df_aug_ctgan[col], errors='raise') # `error = raise` devuelve error si no es posible realizar el proceso correctamente 
+
+# Escalar las características para que tengan media 0 y desviación estándar 1 (recomendado para GNNs)
+scaler = StandardScaler()
+x_array = scaler.fit_transform(df_aug_ctgan[feature_cols])
+x = torch.tensor(x_array, dtype=torch.float)  # Convertir a tensor
+
+# 7. Extraer las etiquetas (y) como un tensor (clases: 0 o 1)
+y = torch.tensor(pd.to_numeric(df_aug_ctgan["Therapeutic_Target"], errors='raise').values, dtype=torch.long)
+
+# 8. Crear el objeto Data de torch_geometric, que contiene nodos (x), aristas (edge_index) y etiquetas (y)
+data = Data(x=x, edge_index=edge_index, y=y)
+
+# Mostrar resumen del objeto para verificar su estructura
+print(data)
+
+
+```
+
+
+
+#### 5.4.4.2. Entrenamiento de un modelo GCN
+
+##### **Entrenamiento y Compilación del Modelo Sin Ajustar** 
+```{python}
+import torch
+import torch.nn.functional as F
+from torch_geometric.nn import GCNConv
+import numpy as np
+
+# -----------------------------------------------------------------------------
+# 1. Preparación: Crear splits de entrenamiento, validación y test
+# -----------------------------------------------------------------------------
+
+# Número total de nodos en el grafo (cada nodo representa un gen)
+num_nodes = data.num_nodes
+
+# Crear un array con los índices de todos los nodos
+indices = np.arange(num_nodes)
+
+# Mezclar aleatoriamente los índices
+np.random.shuffle(indices)
+
+# Definir tamaño del conjunto de entrenamiento (70%)
+train_size = int(0.7 * num_nodes)
+
+# Definir tamaño del conjunto de validación (15%)
+val_size = int(0.15 * num_nodes)
+
+# Obtener los índices correspondientes a cada split
+train_indices = indices[:train_size]  # primeros 70%
+val_indices = indices[train_size:train_size + val_size]  # siguientes 15%
+test_indices = indices[train_size + val_size:]  # resto (15%)
+
+# Inicializar máscaras booleanas para cada split, todas en False
+data.train_mask = torch.zeros(num_nodes, dtype=torch.bool)
+data.val_mask = torch.zeros(num_nodes, dtype=torch.bool)
+data.test_mask = torch.zeros(num_nodes, dtype=torch.bool)
+
+# Activar en cada máscara los nodos que pertenecen al split correspondiente
+data.train_mask[train_indices] = True
+data.val_mask[val_indices] = True
+data.test_mask[test_indices] = True
+
+
+# -----------------------------------------------------------------------------
+# 2. Definición del modelo GCN
+# -----------------------------------------------------------------------------
+
+# Definimos una clase llamada GCN que hereda de torch.nn.Module (estructura estándar en PyTorch para definir modelos)
+class GCN(torch.nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels, dropout=0.5):
+        super(GCN, self).__init__()  # Llama al constructor de la clase base
+        # Primera capa de convolución GCN: transforma de in_channels a hidden_channels
+        self.conv1 = GCNConv(in_channels, hidden_channels)
+        # Segunda capa de convolución: transforma de hidden_channels a out_channels
+        self.conv2 = GCNConv(hidden_channels, out_channels)
+        # Guarda el valor de dropout (probabilidad de desactivación)
+        self.dropout = dropout
+
+    def forward(self, x, edge_index):
+        # Aplicar la primera convolución sobre los nodos del grafo
+        x = self.conv1(x, edge_index)
+        # Activación ReLU para introducir no linealidad
+        x = F.relu(x)
+        # Aplicar dropout para regularización solo durante entrenamiento
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        # Segunda convolución que produce los logits de salida (sin activación final)
+        x = self.conv2(x, edge_index)
+        return x
+
+# Función de inferencia (fuera del modelo) para aplicar softmax y umbral a las predicciones
+def predict(self, x, edge_index, threshold=0.5):
+    """
+    Realiza la inferencia, aplicando softmax y un umbral para obtener las predicciones finales.
+    :param x: Matriz de características.
+    :param edge_index: Tensor de aristas.
+    :param threshold: Umbral de decisión para la probabilidad de la clase 1.
+    :return: Predicciones finales (tensor de etiquetas 0 o 1).
+    """
+    self.eval()  # Pone el modelo en modo evaluación (desactiva dropout, etc.)
+    with torch.no_grad():  # Desactiva el cálculo de gradientes
+        # Propagación hacia adelante del modelo para obtener los logits
+        logits = self.forward(x, edge_index)
+        # Convertimos los logits en probabilidades con softmax
+        probabilities = torch.softmax(logits, dim=1)
+        # Seleccionamos la probabilidad correspondiente a la clase 1
+        y_probs = probabilities[:, 1]
+        # Aplicamos el umbral para convertir a etiquetas binarias
+        predictions = (y_probs >= threshold).long()
+    return predictions
+
+
+# -----------------------------------------------------------------------------
+# 3. Configuración del entrenamiento
+# -----------------------------------------------------------------------------
+
+# Seleccionar el dispositivo donde se entrenará el modelo:
+# Si hay una GPU disponible, se usará; de lo contrario, se usará la CPU.
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Obtener el número de características de entrada (columnas en la matriz x de nodos)
+in_channels = data.num_node_features  # Dimensión de entrada para la GCN
+
+# Definir la dimensión de la capa oculta (número de neuronas intermedias)
+hidden_channels = 16  
+
+# Salidas del modelo: 2 clases para clasificación binaria (por ejemplo, 0 y 1)
+out_channels = 2
+
+# Crear una instancia del modelo GCN con las dimensiones especificadas y trasladarlo al dispositivo (CPU o GPU)
+model_ctgan = GCN(in_channels, hidden_channels, out_channels, dropout=0.5).to(device)
+
+# También transferimos los datos al mismo dispositivo donde estará el modelo
+data = data.to(device)
+
+# Definimos el optimizador Adam, que ajustará los pesos del modelo durante el entrenamiento
+# lr: tasa de aprendizaje; weight_decay: regularización L2 para evitar sobreajuste
+optimizer = torch.optim.Adam(model_ctgan.parameters(), lr=0.01, weight_decay=5e-4)
+
+
+# -----------------------------------------------------------------------------
+# 4. Funciones de entrenamiento y evaluación
+# -----------------------------------------------------------------------------
+
+# Función para realizar una época de entrenamiento
+def train():
+    model_ctgan.train()  # Poner el modelo en modo entrenamiento (activa dropout, etc.)
+    optimizer.zero_grad()  # Reinicia los gradientes acumulados del optimizador
+    out = model_ctgan(data.x, data.edge_index)  # Propagación hacia adelante sobre todo el grafo
+    
+    # Calcular la pérdida (solo sobre los nodos de entrenamiento)
+    # Nota: esta versión **no** utiliza pesos de clase
+    loss = F.cross_entropy(
+        out[data.train_mask],         # Logits de los nodos en el split de entrenamiento
+        data.y[data.train_mask])      # Etiquetas reales de entrenamiento
+        
+    loss.backward()  # Retropropagación del error
+    optimizer.step()  # Actualización de los parámetros del modelo
+    return loss.item()  # Devolver el valor de la pérdida para monitoreo
+
+# Función para evaluar el modelo en los tres splits: train, val y test
+def test():
+    model_ctgan.eval()  # Poner el modelo en modo evaluación (desactiva dropout, batchnorm, etc.)
+    out = model_ctgan(data.x, data.edge_index)  # Propagación hacia adelante
+    
+    # Obtener las predicciones: el índice de mayor valor en los logits
+    pred = out.argmax(dim=1)
+    accuracies = {}  # Diccionario para guardar la precisión por split
+    
+    # Calcular precisión en cada subconjunto (train, val, test)
+    for key, mask in zip(["Train", "Validation", "Test"], 
+                         [data.train_mask, data.val_mask, data.test_mask]):
+        correct = (pred[mask] == data.y[mask]).sum().item()  # Conteo de aciertos
+        acc = correct / mask.sum().item() if mask.sum().item() > 0 else 0  # Precisión
+        accuracies[key] = acc  # Guardar la métrica
+    return accuracies  # Devolver diccionario con las precisiones
+
+
+# -----------------------------------------------------------------------------
+# 5. Ciclo de entrenamiento
+# -----------------------------------------------------------------------------
+
+# Número total de épocas de entrenamiento
+num_epochs = 200
+
+# Bucle principal de entrenamiento
+for epoch in range(1, num_epochs + 1):
+    loss = train()        # Ejecuta una época de entrenamiento y obtiene la pérdida
+    accs = test()         # Evalúa el modelo en los splits de Train/Validation/Test
+
+    # Mostrar métricas cada 10 épocas
+    if epoch % 10 == 0:
+        print(f'Epoch: {epoch:03d}, Loss: {loss:.4f}, '
+              f'Train: {accs["Train"]:.4f}, Val: {accs["Validation"]:.4f}, Test: {accs["Test"]:.4f}')
+
+
+```
+
+##### **Métricas de Evaluación del Modelo GCN Sin Ajustar** 
+```{python}
+import numpy as np
+from sklearn.metrics import confusion_matrix, classification_report
+
+# Poner el modelo en modo evaluación
+model_ctgan.eval()
+# Realizamos la inferencia en todo el grafo
+out = model_ctgan(data.x, data.edge_index)
+# Convertir los logits a predicciones (la clase con el valor máximo)
+pred = out.argmax(dim=1).cpu().numpy()
+
+# Extraer las etiquetas reales
+true = data.y.cpu().numpy()
+
+# Si solo queremos evaluar en el conjunto de test, usamos la test_mask
+test_mask = data.test_mask.cpu().numpy()
+# Aplicamos la máscara de test
+pred_test = pred[test_mask]
+true_test = true[test_mask]
+
+# Calcular la matriz de confusión
+conf_mat = confusion_matrix(true_test, pred_test)
+print("Matriz de Confusión:")
+print(conf_mat)
+
+# Obtener un reporte con precisión, recall, f1-score y más métricas
+report = classification_report(true_test, pred_test)
+print("\nReporte de Clasificación:")
+print(report)
+
+```
+
+
+
+##### Reajuste del Modelo
+Una vez ejecutados los dos siguientes pasos A y B, volver a entrenar y compilar el modelo ejecutándo el código anterior.
+
+###### A) Búsqueda (grid search) de pesos para la función de pérdida
+```{python include=FALSE}
+import numpy as np
+import torch
+import torch.nn.functional as F
+from sklearn.metrics import f1_score
+
+# 1. Calcular pesos iniciales basados en la frecuencia de la clase en el conjunto de entrenamiento.
+# Extraemos las etiquetas de entrenamiento y las pasamos a un array NumPy (desde GPU si es posible)
+train_labels = data.y[data.train_mask].cpu().numpy()  
+
+# Utilizamos np.bincount para contar cuántas instancias hay de cada clase
+class_counts = np.bincount(train_labels)  
+
+print("Recuento de clases en train:", class_counts)  
+
+# Calcular pesos inversos a la frecuencia
+# A menor frecuencia de una clase, mayor peso (para compensar el desbalance)
+initial_weights = 1.0 / class_counts.astype(np.float32)  
+
+# Normalizar para que la suma total de los pesos sea 1
+initial_weights = initial_weights / initial_weights.sum()  
+
+print("Pesos iniciales:", initial_weights)  
+
+# 2. Definir una rejilla de multiplicadores para probar sobre los pesos iniciales
+multiplicadores = [0.5, 1.0, 2.0]  
+
+best_f1 = 0.0  # Inicializamos el mejor F1-score observado
+
+best_weights = None  # Inicializamos la variable para guardar los mejores pesos encontrados
+
+# Número de epochs para la validación en cada combinación
+num_epochs_validacion = 50  
+
+# Grid search: se prueban todas las combinaciones de multiplicadores para clase 0 y clase 1.
+for m0 in multiplicadores:       # Recorre cada multiplicador para la clase 0
+    for m1 in multiplicadores:   # Recorre cada multiplicador para la clase 1
+        # Calcular los pesos candidatos aplicando los multiplicadores a los pesos iniciales
+        candidate_weights = np.array([initial_weights[0] * m0, initial_weights[1] * m1], dtype=np.float32)
+        # Convertimos los pesos candidatos a un tensor compatible con PyTorch y los enviamos al dispositivo (CPU o GPU)
+        candidate_weights_tensor = torch.tensor(candidate_weights, dtype=torch.float, device=device)
+        
+        # Mostrar por consola qué combinación de multiplicadores se está probando
+        print(f"\nProbando multiplicadores => Clase 0: {m0}, Clase 1: {m1}")
+        print("Pesos candidatos:", candidate_weights)
+        
+        # Reinicializar el modelo y el optimizador antes de cada prueba para que todas las combinaciones partan iguales
+        model_ctgan = GCN(in_channels, hidden_channels, out_channels, dropout=0.5).to(device)
+        optimizer = torch.optim.Adam(model_ctgan.parameters(), lr=0.01, weight_decay=5e-4)
+        
+        # Entrenar el modelo con los pesos candidatos durante un número fijo de épocas
+        for epoch in range(num_epochs_validacion):
+            model_ctgan.train()
+            optimizer.zero_grad()
+            out = model_ctgan(data.x, data.edge_index)
+            # Aplicar cross-entropy con pesos de clase
+            loss = F.cross_entropy(out[data.train_mask], data.y[data.train_mask], weight=candidate_weights_tensor)
+            loss.backward()
+            optimizer.step()
+        
+        # Evaluar el rendimiento en el conjunto de validación
+        model_ctgan.eval()
+        out = model_ctgan(data.x, data.edge_index)
+        # Obtener predicciones (clase con mayor logit)
+        pred = out.argmax(dim=1)
+        # Extraer predicciones y etiquetas reales del conjunto de validación
+        pred_val = pred[data.val_mask].cpu().numpy()
+        true_val = data.y[data.val_mask].cpu().numpy()
+        
+        # Calcular F1-score para la clase positiva (asumimos clase 1 como minoritaria)
+        current_f1 = f1_score(true_val, pred_val, pos_label=1)
+        print(f"Multiplicadores ({m0}, {m1}) -> F1 (clase 1): {current_f1:.4f}")
+        
+        # Si es el mejor F1 observado hasta ahora, lo guardamos junto con los pesos correspondientes
+        if current_f1 > best_f1:
+            best_f1 = current_f1
+            best_weights = candidate_weights_tensor
+
+# Mostrar los mejores pesos encontrados y su F1-score asociado
+print("\nMejores pesos encontrados:", best_weights, "con f1-score:", best_f1)
+
+```
+
+
+###### B) Refinar el umbral de decisión: 
+En lugar de asignar la clase 1 cuando la probabilidad es mayor o igual a 0.5 (que es el umbral por defecto cuando se toma el argmax de los logits), vamos a buscar un umbral alternativo que mejore el f1-score para la clase de interés.
+```{python}
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.metrics import f1_score, precision_score, recall_score
+
+# 1. Poner el modelo en modo evaluación y obtener las probabilidades para cada nodo
+model_ctgan.eval()
+with torch.no_grad():
+    out = model_ctgan(data.x, data.edge_index)
+    # Aplicamos softmax para obtener probabilidades
+    probs = torch.softmax(out, dim=1)
+
+# 2. Extraer las probabilidades para la clase positiva (supongamos que la clase 1 es diana terapéutica)
+y_probs = probs[:, 1].cpu().numpy()
+y_true = data.y.cpu().numpy()
+
+# 3. Aplicar la máscara de validación para obtener solo los datos del conjunto de validación
+mask = data.val_mask.cpu().numpy()
+y_true_val = y_true[mask]
+y_probs_val = y_probs[mask]
+
+# 4. Buscar el umbral óptimo variando de 0 a 1 en pasos de 0.01
+thresholds = np.arange(0, 1.01, 0.01)
+f1_scores = []
+precisions = []
+recalls = []
+
+for t in thresholds:
+    # Predicción: se asigna 1 si la probabilidad es mayor o igual que t, 0 en caso contrario.
+    y_pred = (y_probs_val >= t).astype(int)
+    
+    # Calcular las métricas con este umbral
+    f1 = f1_score(y_true_val, y_pred, zero_division=0)
+    precision = precision_score(y_true_val, y_pred, zero_division=0)
+    recall = recall_score(y_true_val, y_pred, zero_division=0)
+    
+    f1_scores.append(f1)
+    precisions.append(precision)
+    recalls.append(recall)
+
+# 5. Encontrar el umbral que maximice el f1-score (puedes elegir otra métrica si lo prefieres)
+best_index = np.argmax(f1_scores)
+best_threshold = thresholds[best_index]
+print(f"Mejor umbral: {best_threshold:.2f}")
+print(f"F1-score en validación: {f1_scores[best_index]:.4f}")
+print(f"Precisión: {precisions[best_index]:.4f}, Recall: {recalls[best_index]:.4f}")
+
+# 6. Graficar las curvas para visualizar el comportamiento del umbral
+plt.figure(figsize=(10, 5))
+plt.plot(thresholds, f1_scores, label='F1-score')
+plt.plot(thresholds, precisions, label='Precisión')
+plt.plot(thresholds, recalls, label='Recall')
+plt.xlabel("Umbral")
+plt.ylabel("Métrica")
+plt.title("Curvas de F1, Precisión y Recall en función del umbral")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+```
+
+
+
+##### Volver a ejecutar el modelo ajustando pesos y umbral de decisión 
+```{python}
+import torch
+import torch.nn.functional as F
+from torch_geometric.nn import GCNConv
+import numpy as np
+
+# -----------------------------------------------------------------------------
+# 1. Preparación: Crear splits de entrenamiento, validación y test
+# -----------------------------------------------------------------------------
+
+# Obtener el número total de nodos en el grafo
+num_nodes = data.num_nodes
+
+# Crear un array con los índices de todos los nodos
+indices = np.arange(num_nodes)
+
+# Mezclar aleatoriamente los índices para garantizar que los subconjuntos sean aleatorios
+np.random.shuffle(indices)
+
+# Calcular el número de nodos para el conjunto de entrenamiento (70%)
+train_size = int(0.7 * num_nodes)
+
+# Calcular el número de nodos para el conjunto de validación (15%)
+val_size = int(0.15 * num_nodes)
+
+# Seleccionar los índices correspondientes a cada conjunto
+train_indices = indices[:train_size]  # primeros 70%
+val_indices = indices[train_size:train_size + val_size]  # siguientes 15%
+test_indices = indices[train_size + val_size:]  # restantes 15%
+
+# Crear máscaras booleanas con la misma longitud que el número de nodos
+data.train_mask = torch.zeros(num_nodes, dtype=torch.bool)
+data.val_mask = torch.zeros(num_nodes, dtype=torch.bool)
+data.test_mask = torch.zeros(num_nodes, dtype=torch.bool)
+
+# Activar (poner en True) las posiciones correspondientes a cada split
+data.train_mask[train_indices] = True
+data.val_mask[val_indices] = True
+data.test_mask[test_indices] = True
+
+# -----------------------------------------------------------------------------
+# 2. Definición del modelo GCN
+# -----------------------------------------------------------------------------
+
+# Definición de una clase para el modelo GCN que hereda de torch.nn.Module
+class GCN(torch.nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels, dropout=0.5):
+        super(GCN, self).__init__()  # Inicializa la clase base de PyTorch
+        # Primera capa de convolución gráfica: reduce/comprime características de entrada
+        self.conv1 = GCNConv(in_channels, hidden_channels)
+        # Segunda capa de convolución gráfica: produce las salidas de clasificación
+        self.conv2 = GCNConv(hidden_channels, out_channels)
+        # Tasa de dropout a aplicar durante el entrenamiento
+        self.dropout = dropout
+
+    def forward(self, x, edge_index):
+        # Aplica la primera convolución GCN con activación ReLU
+        x = self.conv1(x, edge_index)
+        x = F.relu(x)
+        # Aplica dropout solo durante el entrenamiento (no durante inferencia)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        # Aplica la segunda capa GCN para obtener los logits de salida
+        x = self.conv2(x, edge_index)
+        return x  # Devuelve los logits (sin softmax)
+
+# Función auxiliar para hacer predicciones con umbral explícito
+def predict(self, x, edge_index, threshold=best_threshold):   # Se incluye `best_threshold`
+    """
+    Realiza la inferencia, aplicando softmax y un umbral para obtener las predicciones finales.
+    :param x: Matriz de características por nodo.
+    :param edge_index: Conectividad del grafo (aristas).
+    :param threshold: Umbral de decisión para clasificar como clase 1.
+    :return: Vector de predicciones 0 o 1 por nodo.
+    """
+    self.eval()  # Pone el modelo en modo evaluación (desactiva dropout, etc.)
+    with torch.no_grad():  # Desactiva el cálculo de gradientes para eficiencia
+        # Genera los logits del modelo
+        logits = self.forward(x, edge_index)
+        # Aplica softmax para obtener probabilidades por clase
+        probabilities = torch.softmax(logits, dim=1)
+        # Extrae la probabilidad de la clase positiva (clase 1)
+        y_probs = probabilities[:, 1]
+        # Aplica el umbral para convertir probabilidades en etiquetas binarias
+        predictions = (y_probs >= threshold).long()
+    return predictions
+
+# -----------------------------------------------------------------------------
+# 3. Configuración del entrenamiento
+# -----------------------------------------------------------------------------
+
+# Selecciona el dispositivo de cómputo: GPU si está disponible, si no, CPU
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Número de características de entrada por nodo (se extrae de la matriz de nodos)
+in_channels = data.num_node_features  # Es igual al número de columnas en data.x
+
+# Número de unidades en la capa oculta del modelo (hiperparámetro que se puede ajustar)
+hidden_channels = 16
+
+# Número de salidas del modelo: 2 porque se trata de una clasificación binaria (clases 0 y 1)
+out_channels = 2
+
+# Instancia el modelo GCN con los parámetros definidos y lo traslada al dispositivo adecuado
+model_ctgan = GCN(in_channels, hidden_channels, out_channels, dropout=0.5).to(device)
+
+# También se traslada el objeto `data` al mismo dispositivo que el modelo
+data = data.to(device)
+
+# Define el optimizador (Adam) con una tasa de aprendizaje de 0.01 y regularización L2 (weight_decay)
+optimizer = torch.optim.Adam(model_ctgan.parameters(), lr=0.01, weight_decay=5e-4)
+
+
+# -----------------------------------------------------------------------------
+# 4. Funciones de entrenamiento y evaluación
+# -----------------------------------------------------------------------------
+
+# Función para entrenar el modelo en una época
+def train():
+    model_ctgan.train()                         # Pone el modelo en modo entrenamiento
+    optimizer.zero_grad()                 # Reinicia los gradientes acumulados
+    out = model_ctgan(data.x, data.edge_index)  # Propagación hacia adelante en el grafo
+
+    # Cálculo de la pérdida solo sobre los nodos de entrenamiento
+    # Se incluyen pesos para compensar desbalance de clases
+    loss = F.cross_entropy(out[data.train_mask], data.y[data.train_mask], weight=best_weights)
+    
+    loss.backward()                  # Propagación hacia atrás (cálculo del gradiente)
+    optimizer.step()                 # Actualiza los pesos del modelo
+    return loss.item()               # Devuelve el valor de la pérdida para esta época
+
+# Función para evaluar el modelo en los tres subconjuntos (train, val y test)
+def test():
+    model_ctgan.eval()                          # Pone el modelo en modo evaluación (sin dropout, etc.)
+    out = model_ctgan(data.x, data.edge_index)  # Inferencia completa en el grafo
+    pred = out.argmax(dim=1)              # Toma la clase con mayor probabilidad como predicción final
+
+    accuracies = {}
+    # Evalúa la precisión en cada conjunto usando sus respectivas máscaras
+    for key, mask in zip(["Train", "Validation", "Test"], 
+                         [data.train_mask, data.val_mask, data.test_mask]):
+        correct = (pred[mask] == data.y[mask]).sum().item()                # Total de aciertos
+        acc = correct / mask.sum().item() if mask.sum().item() > 0 else 0  # Precisión
+        accuracies[key] = acc
+    return accuracies               # Devuelve un diccionario con la precisión por split
+
+# -----------------------------------------------------------------------------
+# 5. Ciclo de entrenamiento
+# -----------------------------------------------------------------------------
+
+# Número total de épocas de entrenamiento
+num_epochs = 200
+
+# Bucle principal del entrenamiento
+for epoch in range(1, num_epochs + 1):
+    loss = train()     # Ejecuta una época de entrenamiento y obtiene la pérdida
+    accs = test()      # Evalúa el modelo y obtiene la precisión en train, val y test
+
+    # Mostrar métricas cada 10 épocas para seguimiento del entrenamiento
+    if epoch % 10 == 0:
+        print(f'Epoch: {epoch:03d}, Loss: {loss:.4f}, '
+              f'Train: {accs["Train"]:.4f}, Val: {accs["Validation"]:.4f}, Test: {accs["Test"]:.4f}')
+
+```
+
+
+#### 5.4.4.3. Métricas de Evaluación del Modelo GCN
+
+**Matriz de Confusión y Reporte de Clasificación**
+```{python}
+import numpy as np
+from sklearn.metrics import confusion_matrix, classification_report
+
+# Poner el modelo en modo evaluación
+model_ctgan.eval()
+# Realizamos la inferencia en todo el grafo
+out = model_ctgan(data.x, data.edge_index)
+# Convertir los logits a predicciones (la clase con el valor máximo)
+pred = out.argmax(dim=1).cpu().numpy()
+
+# Extraer las etiquetas reales
+true = data.y.cpu().numpy()
+
+# Si solo queremos evaluar en el conjunto de test, usamos la test_mask
+test_mask = data.test_mask.cpu().numpy()
+# Aplicamos la máscara de test
+pred_test = pred[test_mask]
+true_test = true[test_mask]
+
+# Calcular la matriz de confusión
+conf_mat = confusion_matrix(true_test, pred_test)
+print("Matriz de Confusión:")
+print(conf_mat)
+
+# Obtener un reporte con precisión, recall, f1-score y más métricas
+report = classification_report(true_test, pred_test)
+print("\nReporte de Clasificación:")
+print(report)
+
+```
+
+**Curvas ROC y Precision-Recall**
+```{python}
+import torch
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve, auc, precision_recall_curve, average_precision_score
+
+# 1. Evaluar el modelo y obtener las probabilidades en el conjunto de test
+model_ctgan.eval()  # Ponemos el modelo en modo evaluación (no se aplica dropout, etc.)
+with torch.no_grad():  # Desactivamos el cálculo del gradiente para mejorar la eficiencia
+    out = model_ctgan(data.x, data.edge_index)  # Hacemos inferencia con todo el grafo
+    probs = torch.softmax(out, dim=1)     # Aplicamos softmax para obtener probabilidades por clase
+
+# Extraemos la probabilidad asignada a la clase positiva (1 = Therapeutic_Target)
+y_scores = probs[:, 1].cpu().numpy()  # Convertimos el tensor a NumPy en CPU
+y_true = data.y.cpu().numpy()         # También convertimos las etiquetas verdaderas
+
+# Filtramos solo las muestras del conjunto de test utilizando la máscara correspondiente
+test_mask = data.test_mask.cpu().numpy()
+y_true_test = y_true[test_mask]         # Etiquetas reales de test
+y_scores_test = y_scores[test_mask]     # Probabilidades predichas para test
+
+# 2. Calcular la Curva ROC (Receiver Operating Characteristic) y el área bajo la curva (AUC)
+fpr, tpr, thresholds = roc_curve(y_true_test, y_scores_test)  # Calcula FPR y TPR
+roc_auc = auc(fpr, tpr)  # Calcula el área bajo la curva ROC
+
+# Graficamos la curva ROC
+plt.figure()
+plt.plot(fpr, tpr, label=f'ROC Curve (AUC = {roc_auc:.2f})')  # Curva ROC
+plt.plot([0, 1], [0, 1], 'k--', label='Baseline')             # Línea diagonal como referencia
+plt.xlabel('Tasa de Falsos Positivos')
+plt.ylabel('Tasa de Verdaderos Positivos (Recall)')
+plt.title('Curva ROC')
+plt.legend(loc='lower right')
+plt.show()
+
+# 3. Calcular la curva Precision-Recall y el Average Precision (área bajo esta curva)
+precision, recall, thresholds_pr = precision_recall_curve(y_true_test, y_scores_test)
+avg_precision = average_precision_score(y_true_test, y_scores_test)  # Área bajo la curva PR
+
+# 4. Graficar la curva Precision-Recall
+plt.figure()
+plt.plot(recall, precision, label=f'Precision-Recall Curve (AP = {avg_precision:.2f})')
+plt.xlabel('Recall')
+plt.ylabel('Precision')
+plt.title('Curva Precision-Recall')
+plt.legend(loc='lower left')
+plt.show()
+```
+
+
+## 5.5 Exportar el Modelo GCN Entrenado
+```{python eval=FALSE, include=FALSE}
+import os
+import torch
+
+# Crear carpeta si no existe
+os.makedirs("Gans_Models", exist_ok=True)
+
+# Ruta donde guardar el modelo
+ruta_modelo = os.path.join("Gans_Models", "gcn_model_CTgan.pth")
+
+# Guardar el modelo completo (estructura + pesos)
+torch.save(model_ctgan, ruta_modelo)
+
+print(f"Modelo guardado en: {ruta_modelo}")
+
+```
+
+

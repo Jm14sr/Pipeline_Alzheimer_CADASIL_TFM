@@ -1,0 +1,2010 @@
+---
+title: "TFM_5_IMPLEMENTATION"
+author: "Juan Manuel Sancho Romero"
+date: "2025-05-03"
+output:
+  html_document:
+    df_print: paged
+    toc: yes
+    toc_float: true
+    code_folding: show
+    theme: united
+    higlight: tango
+  pdf_document:
+    keep_tex: yes
+    toc: yes
+header-includes: \usepackage[spanish]{babel}
+params:
+  file1: caracteristics_ppi_ALZHEIMER.csv
+  file2: caracteristics_ppi_CADASIL.csv
+  file3: red_ppi_CADASIL.csv
+  file4: red_ppi_CADASIL_Alz.csv
+  file5: caracteristics_ppi_CADASIL_Alz.csv
+  folder.data: C:/Users/juanm/Desktop/MASTER_BIOINFORMATICA/0_TFM_Bioinf/TFM_Resultados
+  p.train: 0.75 # 75% de los datos para definir el conjunto de entrenamiento
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages, message=FALSE, echo=FALSE, warning=FALSE}
+# Paquetes de CRAN
+cran_libraries <- c(
+  "caret", "class", "C50", "DMwR2", "dplyr", "e1071", "gmodels", 
+  "ggfortify", "ggplot2", "kableExtra", "kernlab", "klaR", 
+  "nortest", "randomForest", "reticulate", "ROCR", "knitr", "gridExtra", "grid", "ggraph", "threejs", "rgl"
+)
+
+# Instalar los que faltan
+missing_cran <- cran_libraries[!cran_libraries %in% installed.packages()[, "Package"]]
+if (length(missing_cran) > 0) {
+  install.packages(missing_cran)
+}
+
+# Instalar Bioconductor y GEOquery si falta
+if (!requireNamespace("GEOquery", quietly = TRUE)) {
+  if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+  BiocManager::install("GEOquery")
+}
+
+# Cargar todos los paquetes de CRAN
+invisible(lapply(cran_libraries, library, character.only = TRUE))
+
+# Cargar GEOquery (Bioconductor)
+library(GEOquery)
+```
+
+Establecer el entorno de `Pyhton` con `tensorFlow`, `Pytorch`, `Networkz` y otras librerías necesarias instaladas.
+```{r eval=FALSE, include=FALSE}
+reticulate::use_condaenv("tfm_ml", required = TRUE)
+```
+
+
+NOTA: Aunque los datos del proyecto [] que obtuvo la red PPI de genes o rutas relacionadas o afectadas en la enfermedad del Alzheimer normalizan los datos de expressión usando limma y en este proyecto se ha utilizado la normalización de DESeq2, estas redes son comparables, ya que se están utilizando para la comparación métricas estructurales (topológicas) de las redes PPI obtenidas para los genes o rutas afectadas en Alzheimer y CADASIL. 
+
+
+# 1. Exploración y preparación de los datos
+
+## 1.1 Importamos la red PPI y el fichero con las características de la red para Alzheimer y CADASIL
+
+## Alzheimer
+
+### 1.1.2 Importamos el archivo con las interacciones.
+```{r}
+df_interactions <- read.delim(
+  "C:/Users/juanm/Desktop/MASTER_BIOINFORMATICA/0_TFM_Bioinf/TFM_Resultados/BIOGRID-PROJECT-alzheimers_disease_project-LATEST/INTERACTIONS_BIOGRID_PROJECT_alzheimers_disease_project.txt",
+  sep = "\t",
+  header = TRUE,
+  stringsAsFactors = FALSE
+)
+
+# Ver las primeras filas
+head(df_interactions)
+dim(df_interactions)  # Número de filas y columnas
+```
+
+#### Filtrado de las columnas necesarias para generar el grafo
+NOTA: Se han filtrado las interacciones genéticas, seleccionando solo las físicas. 
+
+```{r}
+# Filtrar solo interacciones físicas (eliminar interacciones genéticas)
+df_ppi_Alz <- df_interactions[df_interactions$`Experimental.System.Type` == "physical", ]
+
+# Seleccionar solo las columnas de los genes interactores
+df_ppi_Alz <- df_ppi_Alz[, c("Official.Symbol.Interactor.A", "Official.Symbol.Interactor.B")]
+
+# Eliminar duplicados
+df_ppi_Alz <- unique(df_ppi_Alz)
+
+# Eliminar self-loops (donde ambos genes son iguales)
+df_ppi_Alz <- df_ppi_Alz[df_ppi_Alz$Official.Symbol.Interactor.A != df_ppi_Alz$Official.Symbol.Interactor.B, ]
+
+# Mostrar las primeras filas
+head(df_ppi_Alz)
+```
+
+#### Renombrar las columnas de df_ppi_Alz
+
+```{r}
+# Renombrar la columna en ambos data frames
+df_ppi_Alz <- df_ppi_Alz %>%
+  dplyr::rename(Gene_A = Official.Symbol.Interactor.A) %>%
+  dplyr::rename(Gene_B = Official.Symbol.Interactor.B)
+
+head(df_ppi_Alz)
+```
+
+
+### 1.1.3 Importamos el archivo con las características
+
+**Importamos el fichero con los datos.**
+```{r, echo=FALSE}
+df_caract_ALZ <- read.csv(
+  file.path(params$folder.data, params$file1), 
+  sep=",",            # Especifica que el separador de columnas es una coma
+  dec=".",            # Define que el separador decimal es un punto
+  header=TRUE,        # Indica que la primera fila contiene los nombres de las columnas
+  stringsAsFactors=FALSE # Evita que las columnas se conviertan en factores automáticamente
+)
+
+# Primeras filas
+head(df_caract_ALZ)
+
+# Número total de genes
+(total_genes_ALZ <- nrow(df_caract_ALZ))
+```
+
+## CADASIL
+
+### 1.1.2 Importamos el archivo con las interacciones.
+```{r}
+df_ppi_CADASIL <- read.csv(
+  file.path(params$folder.data, params$file3),  # Reemplaza con la ruta correcta al archivo
+  sep = ",",                           # Separador de columnas
+  dec = ".",                           # Separador decimal
+  header = TRUE,                       # La primera fila contiene los nombres de las columnas
+  stringsAsFactors = FALSE,           # No convertir texto en factores automáticamente
+  quote = "\"",                        # Indica que las comillas dobles delimitan los textos
+  strip.white = TRUE                  # Elimina espacios en blanco alrededor de los campos
+)
+ head((df_ppi_CADASIL))
+```
+
+### 1.1.3 Importamos el archivo con las características
+```{r}
+# Cargar el archivo de características de la red PPI de CADASIL
+df_caract_CADASIL <- read.csv(
+  file = file.path(params$folder.data, params$file2),  # Ajusta 'file2' al nombre correcto
+  sep = ",",                            # Separador de columnas
+  dec = ".",                            # Separador decimal
+  header = TRUE,                        # La primera fila contiene nombres de columnas
+  stringsAsFactors = FALSE,             # No convertir texto a factores automáticamente
+  quote = "\"",                         # Las comillas dobles delimitan texto
+  strip.white = TRUE                    # Elimina espacios en blanco alrededor de los valores
+)
+
+# Mostrar las primeras filas para verificar que se ha importado bien
+head(df_caract_CADASIL)
+
+# Número total de genes
+(total_genes_CADASIL <- nrow(df_caract_CADASIL))
+```
+
+
+## Genes comunes CADASIL - Alzheimer
+
+### 1.1.2 Importamos el archivo con las interacciones.
+```{r}
+df_ppi_ALZ_CADASIL <- read.csv(
+  file.path(params$folder.data, params$file4),  # Reemplaza con la ruta correcta al archivo
+  sep = ",",                           # Separador de columnas
+  dec = ".",                           # Separador decimal
+  header = TRUE,                       # La primera fila contiene los nombres de las columnas
+  stringsAsFactors = FALSE,           # No convertir texto en factores automáticamente
+  quote = "\"",                        # Indica que las comillas dobles delimitan los textos
+  strip.white = TRUE                  # Elimina espacios en blanco alrededor de los campos
+)
+
+head(df_ppi_ALZ_CADASIL)
+```
+
+### 1.1.3 Importamos el archivo con las características
+```{r}
+# Cargar el archivo de características de la red PPI de CADASIL
+df_caract_ALZ_CADASIL <- read.csv(
+  file = file.path(params$folder.data, params$file5),  # Ajusta 'file2' al nombre correcto
+  sep = ",",                            # Separador de columnas
+  dec = ".",                            # Separador decimal
+  header = TRUE,                        # La primera fila contiene nombres de columnas
+  stringsAsFactors = FALSE,            # No convertir texto a factores automáticamente
+  quote = "\"",                         # Las comillas dobles delimitan texto
+  strip.white = TRUE                   # Elimina espacios en blanco alrededor de los valores
+)
+
+# Mostrar las primeras filas para verificar que se ha importado bien
+head(df_caract_ALZ_CADASIL)
+
+# Número total de genes
+(total_genes_ALZ_CADASIL <- nrow(df_caract_ALZ_CADASIL))
+```
+
+
+## 1.2 Renombrar la columna K_core por K.core en `df_caract_ALZ_CADASIL` y `df_caract_CADASIL` 
+
+```{r}
+# Renombrar la columna en ambos data frames
+df_caract_ALZ_CADASIL <- df_caract_ALZ_CADASIL %>%
+  dplyr::rename(K.core = K_core)
+
+df_caract_CADASIL <- df_caract_CADASIL %>%
+  dplyr::rename(K.core = K_core)
+```
+
+## 1.3 Eliminamos la columna `Num_Drugs` y Gene y las guardamos a parte
+
+```{r}
+# Guardar columnas antes de eliminarlas
+genes_ALZ_CADASIL     <- df_caract_ALZ_CADASIL %>% dplyr::select(Gene, Num_Drugs)
+genes_CADASIL         <- df_caract_CADASIL     %>% dplyr::select(Gene, Num_Drugs)
+genes_ALZ             <- df_caract_ALZ         %>% dplyr::select(Gene, Num_Drugs)
+
+# Eliminar columnas del data frame principal
+df_caract_ALZ_CADASIL_no_gene <- df_caract_ALZ_CADASIL %>% dplyr::select(-Gene, -Num_Drugs)
+df_caract_CADASIL_no_gene     <- df_caract_CADASIL     %>% dplyr::select(-Gene, -Num_Drugs)
+df_caract_ALZ_no_gene         <- df_caract_ALZ         %>% dplyr::select(-Gene, -Num_Drugs)
+```
+
+
+## 1.4 Verificar si todos los genes entre PPI y características coinciden
+
+```{r}
+# Función para comprobar intersección entre genes PPI y df de características
+check_gene_coverage <- function(ppi_df, caract_df, label) {
+  genes_ppi <- union(ppi_df$Gene_A, ppi_df$Gene_B)
+  genes_caract <- caract_df$Gene
+  
+  genes_faltantes <- setdiff(genes_ppi, genes_caract)
+  
+  cat("\n\n---", label, "---\n")
+  cat("Genes en PPI:", length(genes_ppi), "\n")
+  cat("Genes en Características:", length(genes_caract), "\n")
+  cat("Genes de PPI NO presentes en Características:", length(genes_faltantes), "\n")
+  
+  if (length(genes_faltantes) > 0) {
+    cat("Ejemplos de genes faltantes:\n")
+    print(head(genes_faltantes, 10))
+  }
+}
+
+# Ejecutar para cada conjunto
+check_gene_coverage(df_ppi_ALZ_CADASIL, df_caract_ALZ_CADASIL, "ALZ_CADASIL")
+check_gene_coverage(df_ppi_CADASIL,     df_caract_CADASIL,     "CADASIL")
+check_gene_coverage(df_ppi_Alz,         df_caract_ALZ,         "ALZ")
+
+```
+## 1.5 Cargar los conjuntos de datos en Python
+
+```{r}
+py$df_alz <- df_caract_ALZ
+py$df_cadasil <- df_caract_CADASIL
+py$df_alz_cadasil <- df_caract_ALZ_CADASIL
+
+py$ppi_alz <- df_ppi_Alz
+py$ppi_cadasil <- df_ppi_CADASIL
+py$ppi_alz_cadasil <- df_ppi_ALZ_CADASIL
+```
+
+
+```{python}
+# Comprobaciones
+print("df_alz:", df_alz.shape)
+print("ppi_alz:", ppi_alz.shape)
+
+print("df_cadasil:", df_cadasil.shape)
+print("ppi_cadasil:", ppi_cadasil.shape)
+
+print("df_alz_cadasil:", df_alz_cadasil.shape)
+print("ppi_alz_cadasil:", ppi_alz_cadasil.shape)
+```
+
+# 2. Implementación de los modelos obtenidos con SMOTE 
+
+## 2.1 Modelo Random Forest
+
+**Cargar el modelo.**
+```{r}
+rf_smote_model <- readRDS("Smote_Models/rf_smote_model.rds")
+```
+
+**Predicciones para cada conjunto de datos.**
+```{r}
+pred_rf_smote_ALZ_CADASIL <- predict(rf_smote_model, newdata = df_caract_ALZ_CADASIL_no_gene)
+pred_rf_smote_CADASIL     <- predict(rf_smote_model, newdata = df_caract_CADASIL_no_gene)
+pred_rf_smote_ALZ         <- predict(rf_smote_model, newdata = df_caract_ALZ_no_gene)
+```
+
+**Número de predicciones por clase para cada conjunto de datos.**
+```{r}
+data.frame(
+  Dataset = c("ALZ_CADASIL", "CADASIL", "ALZ"),
+  Positivas = c(
+    sum(pred_rf_smote_ALZ_CADASIL == "1"),
+    sum(pred_rf_smote_CADASIL     == "1"),
+    sum(pred_rf_smote_ALZ         == "1")
+  ),
+  Negativas = c(
+    sum(pred_rf_smote_ALZ_CADASIL == "0"),
+    sum(pred_rf_smote_CADASIL     == "0"),
+    sum(pred_rf_smote_ALZ         == "0")
+  )
+)
+
+```
+
+# 2.2 Modelo Decision Tree
+
+**Cargar el modelo.**
+```{r}
+dt_smote_model <- readRDS("Smote_Models/dt_smote_model.rds")
+```
+
+**Predicciones para cada conjunto de datos.**
+```{r}
+pred_dt_smote_ALZ_CADASIL <- predict(dt_smote_model, newdata = df_caract_ALZ_CADASIL_no_gene)
+pred_dt_smote_CADASIL     <- predict(dt_smote_model, newdata = df_caract_CADASIL_no_gene)
+pred_dt_smote_ALZ         <- predict(dt_smote_model, newdata = df_caract_ALZ_no_gene)
+```
+
+**Número de predicciones por clase para cada conjunto de datos.**
+```{r}
+data.frame(
+  Dataset = c("ALZ_CADASIL", "CADASIL", "ALZ"),
+  Positivas = c(
+    sum(pred_dt_smote_ALZ_CADASIL == "Class_1"),
+    sum(pred_dt_smote_CADASIL     == "Class_1"),
+    sum(pred_dt_smote_ALZ         == "Class_1")
+  ),
+  Negativas = c(
+    sum(pred_dt_smote_ALZ_CADASIL == "Class_0"),
+    sum(pred_dt_smote_CADASIL     == "Class_0"),
+    sum(pred_dt_smote_ALZ         == "Class_0")
+  )
+)
+
+```
+
+## 2.3 Modelo GCN
+
+Nota: Al guardar el modelo con `torch.save(model, ...)`, solo se guarda el objeto del modelo, por tanto `PyTorch` necesita saber cómo reconstruir el objeto `class GCN` y funciones externas asociadas, en este caso `predict()`.
+
+```{python }
+import torch
+import torch.nn.functional as F
+from torch_geometric.nn import GCNConv
+import numpy as np
+import pandas as pd
+
+# Definir la clase del modelo (coincide con la del modelo entrenado)
+class GCN(torch.nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels, dropout=0.5):
+        super(GCN, self).__init__()
+        self.conv1 = GCNConv(in_channels, hidden_channels)
+        self.conv2 = GCNConv(hidden_channels, out_channels)
+        self.dropout = dropout
+
+    def forward(self, x, edge_index):
+        x = self.conv1(x, edge_index)
+        x = F.relu(x)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        x = self.conv2(x, edge_index)
+        return x
+
+# Función auxiliar para hacer predicciones (Similar a la del modelo entrenado)
+def predict(model, x, edge_index, threshold=0.5):
+    model.eval()
+    with torch.no_grad():
+        logits = model(x, edge_index)
+        probs = torch.softmax(logits, dim=1)
+        return (probs[:, 1] >= threshold).long()
+
+# --------------------------
+# Cargar el modelo entrenado
+# --------------------------
+device = torch.device('cuda') # Movemos los tensores a cuda
+model_smote = torch.load("Smote_Models/gcn_SMOTE_model.pt", map_location=device)
+model_smote.eval()
+
+# -------------------------------------------
+# Función de predicción desde los dataframes
+# -------------------------------------------
+def predict_from_df(df_features, df_edges, threshold=0.64):
+    
+    # Asegura que las entradas desde R vía reticulate se conviertan en DataFrames de pandas
+    df_features = pd.DataFrame(df_features)
+    df_edges = pd.DataFrame(df_edges)
+    
+    # La columna "Gene" se usa como índice (identificador de nodos)
+    df_features = df_features.set_index("Gene")
+    
+    # Obtiene un conjunto ordenado de todos los genes involucrados en el grafo (en Gene_A y Gene_B)
+    node_names = sorted(set(df_edges["Gene_A"]) | set(df_edges["Gene_B"]))
+    
+    # Filtra el DataFrame para conservar solo las filas (genes) presentes en el grafo
+    df_features = df_features.loc[node_names]
+
+    # Asegurar que se utilizan columnas numéricas
+    numeric_columns = [
+        "Degree", "Degree_Centrality", "Betweenness_Centrality", "Closeness_Centrality",
+        "Eigenvector_Centrality", "K.core", "PageRank", "Clustering_Coefficient", "Num_Orthologs"
+        ]
+        
+    df_features = df_features[numeric_columns]
+    
+    # Convierte el DataFrame de características a un tensor de PyTorch y lo mueve al dispositivo (GPU o CPU)
+    x = torch.tensor(df_features.values, dtype=torch.float).to(device)
+
+    # Crea un diccionario para mapear cada gen a su índice (posición en la matriz de nodos)
+    gene_to_index = {gene: i for i, gene in enumerate(df_features.index)}
+    
+    # Genera listas de índices para cada arista del grafo, filtrando solo genes que están en el diccionario
+    source = [gene_to_index[g] for g in df_edges["Gene_A"] if g in gene_to_index]
+    target = [gene_to_index[g] for g in df_edges["Gene_B"] if g in gene_to_index]
+    
+    # Crea el edge_index requerido por torch_geometric y lo mueve al dispositivo
+    edge_index = torch.tensor([source, target], dtype=torch.long).to(device)
+
+    # Llama a la función de predicción que aplica el modelo y el umbral
+    preds = predict(model_smote, x, edge_index, threshold=threshold)
+    
+    # Devuelve las predicciones como lista de clases (0 o 1)
+    return preds.tolist()
+
+
+# --------------------------
+# Ejecutar predicciones
+# --------------------------
+pred_gcn_smote_ALZ = predict_from_df(df_alz, ppi_alz, threshold=0.64)
+pred_gcn_smote_CADASIL = predict_from_df(df_cadasil, ppi_cadasil, threshold=0.64)
+pred_gcn_smote_ALZ_CADASIL = predict_from_df(df_alz_cadasil, ppi_alz_cadasil, threshold=0.64)
+
+# Enviar resultados a R
+#r.assign("pred_gcn_smote_ALZ", preds_alz)
+#r.assign("pred_gcn_smote_CADASIL", preds_cadasil)
+#r.assign("pred_gcn_smote_ALZ_CADASIL", preds_alz_cadasil)
+
+```
+
+
+```{r}
+library(reticulate)
+
+pred_gcn_smote_ALZ <- py$pred_gcn_smote_ALZ
+pred_gcn_smote_CADASIL <- py$pred_gcn_smote_CADASIL
+pred_gcn_smote_ALZ_CADASIL <- py$pred_gcn_smote_ALZ_CADASIL
+
+
+# Mostrar conteo de predicciones
+data.frame(
+  Dataset = c("ALZ", "CADASIL", "ALZ_CADASIL"),
+  Positivas = c(
+    sum(pred_gcn_smote_ALZ == 1),
+    sum(pred_gcn_smote_CADASIL == 1),
+    sum(pred_gcn_smote_ALZ_CADASIL == 1)
+  ),
+  Negativas = c(
+    sum(pred_gcn_smote_ALZ == 0),
+    sum(pred_gcn_smote_CADASIL == 0),
+    sum(pred_gcn_smote_ALZ_CADASIL == 0)
+  )
+)
+```
+
+# 3. Implementación de los modelos obtenidos con GANS
+
+## 3.1 Modelos obtenidos con WGAN_GP 
+
+### 3.1.1 Modelo Random Forest
+
+**Cargar el modelo.**
+```{r}
+rf_WganGp_model <- readRDS("Gans_Models/rf_model_WganGp.rds")
+```
+
+**Predicciones para cada conjunto de datos.**
+```{r}
+pred_rf_WganGp_ALZ_CADASIL <- predict(rf_WganGp_model, newdata = df_caract_ALZ_CADASIL_no_gene)
+pred_rf_WganGp_CADASIL     <- predict(rf_WganGp_model, newdata = df_caract_CADASIL_no_gene)
+pred_rf_WganGp_ALZ         <- predict(rf_WganGp_model, newdata = df_caract_ALZ_no_gene)
+```
+
+**Número de predicciones por clase para cada conjunto de datos.**
+```{r}
+data.frame(
+  Dataset = c("ALZ_CADASIL", "CADASIL", "ALZ"),
+  Positivas = c(
+    sum(pred_rf_WganGp_ALZ_CADASIL == "Class_1"),
+    sum(pred_rf_WganGp_CADASIL     == "Class_1"),
+    sum(pred_rf_WganGp_ALZ         == "Class_1")
+  ),
+  Negativas = c(
+    sum(pred_rf_WganGp_ALZ_CADASIL == "Class_0"),
+    sum(pred_rf_WganGp_CADASIL     == "Class_0"),
+    sum(pred_rf_WganGp_ALZ         == "Class_0")
+  )
+)
+
+```
+
+### 3.1.2 Modelo Decision Tree
+
+**Cargar el modelo.**
+```{r}
+dt_WganGp_model <- readRDS("Gans_Models/dt_model_WganGp.rds")
+```
+
+**Predicciones para cada conjunto de datos.**
+```{r}
+pred_dt_WganGp_ALZ_CADASIL <- predict(dt_WganGp_model, newdata = df_caract_ALZ_CADASIL_no_gene)
+pred_dt_WganGp_CADASIL     <- predict(dt_WganGp_model, newdata = df_caract_CADASIL_no_gene)
+pred_dt_WganGp_ALZ         <- predict(dt_WganGp_model, newdata = df_caract_ALZ_no_gene)
+```
+
+
+**Número de predicciones por clase para cada conjunto de datos.**
+```{r}
+data.frame(
+  Dataset = c("ALZ_CADASIL", "CADASIL", "ALZ"),
+  Positivas = c(
+    sum(pred_dt_WganGp_ALZ_CADASIL == "Class_1"),
+    sum(pred_dt_WganGp_CADASIL     == "Class_1"),
+    sum(pred_dt_WganGp_ALZ         == "Class_1")
+  ),
+  Negativas = c(
+    sum(pred_dt_WganGp_ALZ_CADASIL == "Class_0"),
+    sum(pred_dt_WganGp_CADASIL     == "Class_0"),
+    sum(pred_dt_WganGp_ALZ         == "Class_0")
+  )
+)
+
+```
+
+## 3.1.3 Modelo GCN
+
+Nota: Al guardar el modelo con `torch.save(model, ...)`, solo se guarda el objeto del modelo, por tanto `PyTorch` necesita saber cómo reconstruir el objeto `class GCN` y funciones externas asociadas, en este caso `predict()`.
+
+```{python }
+import torch
+import torch.nn.functional as F
+from torch_geometric.nn import GCNConv
+import numpy as np
+import pandas as pd
+
+# Definir la clase del modelo (coincide con la del modelo entrenado)
+class GCN(torch.nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels, dropout=0.5):
+        super(GCN, self).__init__()
+        self.conv1 = GCNConv(in_channels, hidden_channels)
+        self.conv2 = GCNConv(hidden_channels, out_channels)
+        self.dropout = dropout
+
+    def forward(self, x, edge_index):
+        x = self.conv1(x, edge_index)
+        x = F.relu(x)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        x = self.conv2(x, edge_index)
+        return x
+
+# Función auxiliar para hacer predicciones (Similar a la del modelo entrenado)
+def predict(model, x, edge_index, threshold=0.5):
+    model.eval()
+    with torch.no_grad():
+        logits = model(x, edge_index)
+        probs = torch.softmax(logits, dim=1)
+        return (probs[:, 1] >= threshold).long()
+
+# --------------------------
+# Cargar el modelo entrenado
+# --------------------------
+device = torch.device('cuda') # Movemos los tensores a cuda
+model_gcn_WganGp = torch.load("Gans_Models/gcn_model_WganGp.pth", map_location=device)
+model_gcn_WganGp.eval()
+
+# -------------------------------------------
+# Función de predicción desde los dataframes
+# -------------------------------------------
+def predict_from_df(df_features, df_edges, threshold=0.57): # Mejor umbral obtenido en (TFM3_ML_GANS)
+    
+    # Asegura que las entradas desde R vía reticulate se conviertan en DataFrames de pandas
+    df_features = pd.DataFrame(df_features)
+    df_edges = pd.DataFrame(df_edges)
+    
+    # La columna "Gene" se usa como índice (identificador de nodos)
+    df_features = df_features.set_index("Gene")
+    
+    # Obtiene un conjunto ordenado de todos los genes involucrados en el grafo (en Gene_A y Gene_B)
+    node_names = sorted(set(df_edges["Gene_A"]) | set(df_edges["Gene_B"]))
+    
+    # Filtra el DataFrame para conservar solo las filas (genes) presentes en el grafo
+    df_features = df_features.loc[node_names]
+
+    # Asegurar que se utilizan columnas numéricas
+    numeric_columns = [
+        "Degree", "Degree_Centrality", "Betweenness_Centrality", "Closeness_Centrality",
+        "Eigenvector_Centrality", "K.core", "PageRank", "Clustering_Coefficient", "Num_Orthologs"
+        ]
+        
+    df_features = df_features[numeric_columns]
+    
+    # Convierte el DataFrame de características a un tensor de PyTorch y lo mueve al dispositivo (GPU o CPU)
+    x = torch.tensor(df_features.values, dtype=torch.float).to(device)
+
+    # Crea un diccionario para mapear cada gen a su índice (posición en la matriz de nodos)
+    gene_to_index = {gene: i for i, gene in enumerate(df_features.index)}
+    
+    # Genera listas de índices para cada arista del grafo, filtrando solo genes que están en el diccionario
+    source = [gene_to_index[g] for g in df_edges["Gene_A"] if g in gene_to_index]
+    target = [gene_to_index[g] for g in df_edges["Gene_B"] if g in gene_to_index]
+    
+    # Crea el edge_index requerido por torch_geometric y lo mueve al dispositivo
+    edge_index = torch.tensor([source, target], dtype=torch.long).to(device)
+
+    # Llama a la función de predicción que aplica el modelo y el umbral
+    preds = predict(model_gcn_WganGp, x, edge_index, threshold=threshold)
+    
+    # Devuelve las predicciones como lista de clases (0 o 1)
+    return preds.tolist()
+
+
+# --------------------------
+# Ejecutar predicciones
+# --------------------------
+pred_gcn_WganGp_ALZ = predict_from_df(df_alz, ppi_alz, threshold=0.57)
+pred_gcn_WganGp_CADASIL = predict_from_df(df_cadasil, ppi_cadasil, threshold=0.57)
+pred_gcn_WganGp_ALZ_CADASIL = predict_from_df(df_alz_cadasil, ppi_alz_cadasil, threshold=0.57)
+
+
+```
+
+
+```{r}
+library(reticulate)
+
+pred_gcn_WganGp_ALZ <- py$pred_gcn_WganGp_ALZ
+pred_gcn_WganGp_CADASIL <- py$pred_gcn_WganGp_CADASIL
+pred_gcn_WganGp_ALZ_CADASIL <- py$pred_gcn_WganGp_ALZ_CADASIL
+
+
+# Mostrar conteo de predicciones
+data.frame(
+  Dataset = c("ALZ", "CADASIL", "ALZ_CADASIL"),
+  Positivas = c(
+    sum(pred_gcn_WganGp_ALZ == 1),
+    sum(pred_gcn_WganGp_CADASIL == 1),
+    sum(pred_gcn_WganGp_ALZ_CADASIL == 1)
+  ),
+  Negativas = c(
+    sum(pred_gcn_WganGp_ALZ == 0),
+    sum(pred_gcn_WganGp_CADASIL == 0),
+    sum(pred_gcn_WganGp_ALZ_CADASIL == 0)
+  )
+)
+```
+
+## 3.2 Modelos obtenidos con CTGAN
+
+### 3.2.1 Modelo Random Forest
+
+**Cargar el modelo.**
+```{r}
+rf_CTgan_model <- readRDS("Gans_Models/rf_model_CTgan.rds")
+```
+
+**Predicciones para cada conjunto de datos.**
+```{r}
+pred_rf_CTgan_ALZ_CADASIL <- predict(rf_CTgan_model, newdata = df_caract_ALZ_CADASIL_no_gene)
+pred_rf_CTgan_CADASIL     <- predict(rf_CTgan_model, newdata = df_caract_CADASIL_no_gene)
+pred_rf_CTgan_ALZ         <- predict(rf_CTgan_model, newdata = df_caract_ALZ_no_gene)
+```
+
+**Número de predicciones por clase para cada conjunto de datos.**
+```{r}
+data.frame(
+  Dataset = c("ALZ_CADASIL", "CADASIL", "ALZ"),
+  Positivas = c(
+    sum(pred_rf_CTgan_ALZ_CADASIL == "Class_1"),
+    sum(pred_rf_CTgan_CADASIL     == "Class_1"),
+    sum(pred_rf_CTgan_ALZ         == "Class_1")
+  ),
+  Negativas = c(
+    sum(pred_rf_CTgan_ALZ_CADASIL == "Class_0"),
+    sum(pred_rf_CTgan_CADASIL     == "Class_0"),
+    sum(pred_rf_CTgan_ALZ         == "Class_0")
+  )
+)
+
+```
+
+### 3.2.2 Modelo Decision Tree
+
+**Cargar el modelo.**
+```{r}
+dt_CTgan_model <- readRDS("Gans_Models/dt_model_CTgan.rds")
+```
+
+**Predicciones para cada conjunto de datos.**
+```{r}
+pred_dt_CTgan_ALZ_CADASIL <- predict(dt_CTgan_model, newdata = df_caract_ALZ_CADASIL_no_gene)
+pred_dt_CTgan_CADASIL     <- predict(dt_CTgan_model, newdata = df_caract_CADASIL_no_gene)
+pred_dt_CTgan_ALZ         <- predict(dt_CTgan_model, newdata = df_caract_ALZ_no_gene)
+```
+
+
+**Número de predicciones por clase para cada conjunto de datos.**
+```{r}
+data.frame(
+  Dataset = c("ALZ_CADASIL", "CADASIL", "ALZ"),
+  Positivas = c(
+    sum(pred_dt_CTgan_ALZ_CADASIL == "Class_1"),
+    sum(pred_dt_CTgan_CADASIL     == "Class_1"),
+    sum(pred_dt_CTgan_ALZ         == "Class_1")
+  ),
+  Negativas = c(
+    sum(pred_dt_CTgan_ALZ_CADASIL == "Class_0"),
+    sum(pred_dt_CTgan_CADASIL     == "Class_0"),
+    sum(pred_dt_CTgan_ALZ         == "Class_0")
+  )
+)
+
+```
+
+## 3.2.3 Modelo GCN
+
+Nota: Al guardar el modelo con `torch.save(model, ...)`, solo se guarda el objeto del modelo, por tanto `PyTorch` necesita saber cómo reconstruir el objeto `class GCN` y funciones externas asociadas, en este caso `predict()`.
+
+```{python }
+import torch
+import torch.nn.functional as F
+from torch_geometric.nn import GCNConv
+import numpy as np
+import pandas as pd
+
+# Definir la clase del modelo (coincide con la del modelo entrenado)
+class GCN(torch.nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels, dropout=0.5):
+        super(GCN, self).__init__()
+        self.conv1 = GCNConv(in_channels, hidden_channels)
+        self.conv2 = GCNConv(hidden_channels, out_channels)
+        self.dropout = dropout
+
+    def forward(self, x, edge_index):
+        x = self.conv1(x, edge_index)
+        x = F.relu(x)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        x = self.conv2(x, edge_index)
+        return x
+
+# Función auxiliar para hacer predicciones (Similar a la del modelo entrenado)
+def predict(model, x, edge_index, threshold=0.5):
+    model.eval()
+    with torch.no_grad():
+        logits = model(x, edge_index)
+        probs = torch.softmax(logits, dim=1)
+        return (probs[:, 1] >= threshold).long()
+
+# --------------------------
+# Cargar el modelo entrenado
+# --------------------------
+device = torch.device('cuda') # Movemos los tensores a cuda
+model_gcn_CTgan = torch.load("Gans_Models/gcn_model_CTgan.pth", map_location=device)
+model_gcn_CTgan.eval()
+
+# -------------------------------------------
+# Función de predicción desde los dataframes
+# -------------------------------------------
+def predict_from_df(df_features, df_edges, threshold=0.58): # Mejor umbral obtenido
+    
+    # Asegura que las entradas desde R vía reticulate se conviertan en DataFrames de pandas
+    df_features = pd.DataFrame(df_features)
+    df_edges = pd.DataFrame(df_edges)
+    
+    # La columna "Gene" se usa como índice (identificador de nodos)
+    df_features = df_features.set_index("Gene")
+    
+    # Obtiene un conjunto ordenado de todos los genes involucrados en el grafo (en Gene_A y Gene_B)
+    node_names = sorted(set(df_edges["Gene_A"]) | set(df_edges["Gene_B"]))
+    
+    # Filtra el DataFrame para conservar solo las filas (genes) presentes en el grafo
+    df_features = df_features.loc[node_names]
+
+    # Asegurar que se utilizan columnas numéricas
+    numeric_columns = [
+        "Degree", "Degree_Centrality", "Betweenness_Centrality", "Closeness_Centrality",
+        "Eigenvector_Centrality", "K.core", "PageRank", "Clustering_Coefficient", "Num_Orthologs"
+        ]
+        
+    df_features = df_features[numeric_columns]
+    
+    # Convierte el DataFrame de características a un tensor de PyTorch y lo mueve al dispositivo (GPU o CPU)
+    x = torch.tensor(df_features.values, dtype=torch.float).to(device)
+
+    # Crea un diccionario para mapear cada gen a su índice (posición en la matriz de nodos)
+    gene_to_index = {gene: i for i, gene in enumerate(df_features.index)}
+    
+    # Genera listas de índices para cada arista del grafo, filtrando solo genes que están en el diccionario
+    source = [gene_to_index[g] for g in df_edges["Gene_A"] if g in gene_to_index]
+    target = [gene_to_index[g] for g in df_edges["Gene_B"] if g in gene_to_index]
+    
+    # Crea el edge_index requerido por torch_geometric y lo mueve al dispositivo
+    edge_index = torch.tensor([source, target], dtype=torch.long).to(device)
+
+    # Llama a la función de predicción que aplica el modelo y el umbral
+    preds = predict(model_gcn_CTgan, x, edge_index, threshold=threshold)
+    
+    # Devuelve las predicciones como lista de clases (0 o 1)
+    return preds.tolist()
+
+
+# --------------------------
+# Ejecutar predicciones
+# --------------------------
+pred_gcn_CTgan_ALZ = predict_from_df(df_alz, ppi_alz, threshold=0.58)
+pred_gcn_CTgan_CADASIL = predict_from_df(df_cadasil, ppi_cadasil, threshold=0.58)
+pred_gcn_CTgan_ALZ_CADASIL = predict_from_df(df_alz_cadasil, ppi_alz_cadasil, threshold=0.58)
+
+
+```
+
+
+```{r}
+library(reticulate)
+
+pred_gcn_CTgan_ALZ <- py$pred_gcn_CTgan_ALZ
+pred_gcn_CTgan_CADASIL <- py$pred_gcn_CTgan_CADASIL
+pred_gcn_CTgan_ALZ_CADASIL <- py$pred_gcn_CTgan_ALZ_CADASIL
+
+
+# Mostrar conteo de predicciones
+data.frame(
+  Dataset = c("ALZ", "CADASIL", "ALZ_CADASIL"),
+  Positivas = c(
+    sum(pred_gcn_CTgan_ALZ == 1),
+    sum(pred_gcn_CTgan_CADASIL == 1),
+    sum(pred_gcn_CTgan_ALZ_CADASIL == 1)
+  ),
+  Negativas = c(
+    sum(pred_gcn_CTgan_ALZ == 0),
+    sum(pred_gcn_CTgan_CADASIL == 0),
+    sum(pred_gcn_CTgan_ALZ_CADASIL == 0)
+  )
+)
+```
+
+
+# 4. Análisis comparativo de los genes seleccionados como diana terapéutica
+
+## 4.0 De los genes de CADASIL, cuantos coinciden en bruto con dianas terapéuticas del alzheimer
+
+En este caso no tienen por qué cumplir características de alta centralidad, número elevado de ortólogos... etc.
+```{r}
+# Genes diana del alzheimer
+genes_alzheimer <- c("APP", "MAPT", "APOE", "CD2AP", "CLU", "PICALM", "BIN1", "TREM2", "SOD1", "SORL1", "ABCA7", "ABCA1", "ADAMTS4", "GSK3B", "GRN", "PSAP", "ACHE", "CACNA1D", "CACNA1C", "BACE", "BACE1", "BACE2", "ASP2", "KIAA1149", "GRIA", "GRIA1", "GRIA4", "D2R", "DRD2 ", "HTR6", "PPARG", "TARDBP", "AGER", "MAO", "MAOA", "MAOB", "GRIN1", "GRIN2A", "GRIN2B", "GRIN2C", "GRIN2D", "GRIN3A", "GRIN3B") 
+
+# Ver qué genes de interés para Alzheimer están presentes en genes_comunes_all
+genes_presentes <- intersect(genes_alzheimer, df_caract_CADASIL$Gene)
+
+# Mostrar resultado
+cat("Genes de Alzheimer presentes en CADASIL:\n")
+print(genes_presentes)
+
+# Número de coincidencias
+cat("Número total:", length(genes_presentes), "genes\n")
+```
+
+## 4.1 Modelos GCN 
+
+### 4.1.1 Predicciones genes Alzheimer-Cadasil
+```{r}
+# Convertir predicciones a factores legibles
+genes_ALZ_CADASIL$Pred_GCN_WGAN_GP <- factor(pred_gcn_WganGp_ALZ_CADASIL, levels = c(0,1), labels = c("No", "Sí"))
+genes_ALZ_CADASIL$Pred_GCN_CTGAN   <- factor(pred_gcn_CTgan_ALZ_CADASIL,   levels = c(0,1), labels = c("No", "Sí"))
+genes_ALZ_CADASIL$Pred_GCN_SMOTE   <- factor(pred_gcn_smote_ALZ_CADASIL,   levels = c(0,1), labels = c("No", "Sí"))
+
+# Obtener los genes predichos como diana por cada modelo
+genes_wgan  <- genes_ALZ_CADASIL %>% filter(Pred_GCN_WGAN_GP == "Sí") %>% pull(Gene)
+genes_ctgan <- genes_ALZ_CADASIL %>% filter(Pred_GCN_CTGAN   == "Sí") %>% pull(Gene)
+genes_smote <- genes_ALZ_CADASIL %>% filter(Pred_GCN_SMOTE   == "Sí") %>% pull(Gene)
+
+# Intersecciones
+genes_comunes_all  <- Reduce(intersect, list(genes_wgan, genes_ctgan, genes_smote))  # los 3 modelos
+genes_comunes_w_s  <- intersect(genes_wgan, genes_smote)                  # WGAN + SMOTE
+genes_comunes_w_c  <- intersect(genes_wgan, genes_ctgan)                  # WGAN + CTGAN
+genes_comunes_s_c  <- intersect(genes_smote, genes_ctgan)                 # SMOTE + CTGAN
+
+# Genes únicos de cada modelo
+genes_only_wgan  <- setdiff(genes_wgan, union(genes_ctgan, genes_smote))
+genes_only_ctgan <- setdiff(genes_ctgan, union(genes_wgan, genes_smote))
+genes_only_smote <- setdiff(genes_smote, union(genes_wgan, genes_ctgan))
+
+# Crear tabla resumen
+tabla_resumen <- data.frame(
+  Modelo = c("WGAN_GP", "CTGAN", "SMOTE", "Común a los 3"),
+  N_Predicciones = c(
+    length(genes_wgan),
+    length(genes_ctgan),
+    length(genes_smote),
+    length(genes_comunes_all)
+  ),
+  Genes = c(
+    NA, NA, NA, paste(genes_comunes_all, collapse = ", ")
+  ),
+  stringsAsFactors = FALSE
+)
+
+# Ver tabla
+print(tabla_resumen)
+print(genes_ctgan)
+```
+
+**Tabla más adecuada**
+```{r}
+# Función auxiliar para mostrar todos o una vista previa de los genes
+formatear_genes <- function(lista_genes, vista = "completa", n = 3) {
+  if (length(lista_genes) == 0) return(NA)
+  if (vista == "preview") {
+    return(paste0(paste(lista_genes[1:min(n, length(lista_genes))], collapse = ", "), ", ..."))
+  } else {
+    return(paste(lista_genes, collapse = ", "))
+  }
+}
+
+# Crear tabla resumen personalizada
+tabla_resumen <- data.frame(
+  Modelo = c("WGAN_GP_gcn", "CTGAN_gcn", "SMOTE_gcn", "Común a los 3"),
+  N_Predicciones = c(
+    length(genes_wgan),
+    length(genes_ctgan),
+    length(genes_smote),
+    length(genes_comunes_all)
+  ),
+  Genes = c(
+    formatear_genes(genes_wgan),
+    formatear_genes(genes_ctgan, vista = "preview"),
+    formatear_genes(genes_smote),
+    formatear_genes(genes_comunes_all)
+  ),
+  stringsAsFactors = FALSE
+)
+
+# Ver tabla
+print(tabla_resumen)
+
+# Crear objeto tabla resumen
+tabla <- tableGrob(tabla_resumen)
+
+# Convertir tabla en un objeto gráfico (grob)
+if (!dir.exists("Figuras_TFM")) dir.create("Figuras_TFM")
+
+# Guardar como imagen
+#png("Figuras_TFM/resumen_modelos_gcn_Alz_Cadasil.png", width = 1200, height = 300)
+#grid::grid.draw(tabla)
+#dev.off() # Cierra el dispositivo gráfico activo en R
+
+```
+
+Cual de estos genes predichos en `genes_ctgan` se corresponden con nuestras dianas terapéuticas iniciales.
+```{r}
+# Genes diana del alzheimer
+genes_alzheimer <- c("APP", "MAPT", "APOE", "CD2AP", "CLU", "PICALM", "BIN1", "TREM2", "SOD1", "SORL1", "ABCA7", "ABCA1", "ADAMTS4", "GSK3B", "GRN", "PSAP", "ACHE", "CACNA1D", "CACNA1C", "BACE", "BACE1", "BACE2", "ASP2", "KIAA1149", "GRIA", "GRIA1", "GRIA4", "D2R", "DRD2 ", "HTR6", "PPARG", "TARDBP", "AGER", "MAO", "MAOA", "MAOB", "GRIN1", "GRIN2A", "GRIN2B", "GRIN2C", "GRIN2D", "GRIN3A", "GRIN3B", "NOTCH3", "PSAP") 
+
+# Ver qué genes de interés para Alzheimer están presentes en genes_ctgan
+genes_presentes <- intersect(genes_alzheimer, genes_ctgan)
+
+# Mostrar resultado
+cat("Genes de Alzheimer presentes en genes_comunes_all:\n")
+print(genes_presentes)
+
+# Número de coincidencias
+cat("Número total:", length(genes_presentes), "genes\n")
+```
+
+ISM2: 
+<https://www.mdpi.com/1422-0067/24/7/6639>
+
+CaRF: 
+<https://www.sciencedirect.com/science/article/abs/pii/S014341601100073X>
+
+RABGGTA: 
+<https://www.sciencedirect.com/science/article/pii/S0361923023002587>
+<https://www.mdpi.com/2076-3425/13/11/1531>
+
+### 4.1.2 Predicciones genes Cadasil
+```{r}
+# Convertir predicciones a factores legibles
+genes_CADASIL$Pred_GCN_WGAN_GP <- factor(pred_gcn_WganGp_CADASIL, levels = c(0,1), labels = c("No", "Sí"))
+genes_CADASIL$Pred_GCN_CTGAN   <- factor(pred_gcn_CTgan_CADASIL,   levels = c(0,1), labels = c("No", "Sí"))
+genes_CADASIL$Pred_GCN_SMOTE   <- factor(pred_gcn_smote_CADASIL,   levels = c(0,1), labels = c("No", "Sí"))
+
+# Obtener los genes predichos como diana por cada modelo
+genes_wgan  <- genes_CADASIL %>% filter(Pred_GCN_WGAN_GP == "Sí") %>% pull(Gene)
+genes_ctgan <- genes_CADASIL %>% filter(Pred_GCN_CTGAN   == "Sí") %>% pull(Gene)
+genes_smote <- genes_CADASIL %>% filter(Pred_GCN_SMOTE   == "Sí") %>% pull(Gene)
+
+# Intersecciones
+genes_comunes_all  <- Reduce(intersect, list(genes_wgan, genes_ctgan, genes_smote))  # los 3 modelos
+genes_comunes_w_s  <- intersect(genes_wgan, genes_smote)                             # WGAN + SMOTE
+genes_comunes_w_c  <- intersect(genes_wgan, genes_ctgan)                             # WGAN + CTGAN
+genes_comunes_s_c  <- intersect(genes_smote, genes_ctgan)                            # SMOTE + CTGAN
+
+# Genes únicos de cada modelo
+genes_only_wgan  <- setdiff(genes_wgan, union(genes_ctgan, genes_smote))
+genes_only_ctgan <- setdiff(genes_ctgan, union(genes_wgan, genes_smote))
+genes_only_smote <- setdiff(genes_smote, union(genes_wgan, genes_ctgan))
+
+# Crear tabla resumen
+tabla_resumen <- data.frame(
+  Modelo = c("WGAN_GP", "CTGAN", "SMOTE", "Común a los 3"),
+  N_Predicciones = c(
+    length(genes_wgan),
+    length(genes_ctgan),
+    length(genes_smote),
+    length(genes_comunes_all)
+  ),
+  Genes = c(
+    NA, NA, NA, paste(genes_comunes_all, collapse = ", ")
+  ),
+  stringsAsFactors = FALSE
+)
+
+# Ver tabla
+print(tabla_resumen)
+```
+
+Genes comunes
+```{r}
+genes_comunes_all
+```
+
+Cual de estos genes predichos en común por los tres modelos se corresponden con nuestras dianas terapéuticas iniciales.
+```{r}
+# Genes diana del alzheimer
+genes_alzheimer <- c("APP", "MAPT", "APOE", "CD2AP", "CLU", "PICALM", "BIN1", "TREM2", "SOD1", "SORL1", "ABCA7", "ABCA1", "ADAMTS4", "GSK3B", "GRN", "PSAP", "ACHE", "CACNA1D", "CACNA1C", "BACE", "BACE1", "BACE2", "ASP2", "KIAA1149", "GRIA", "GRIA1", "GRIA4", "D2R", "DRD2 ", "HTR6", "PPARG", "TARDBP", "AGER", "MAO", "MAOA", "MAOB", "GRIN1", "GRIN2A", "GRIN2B", "GRIN2C", "GRIN2D", "GRIN3A", "GRIN3B", "NOTCH3", "PSAP", "PI3K", "Akt", "MAPK", "TGF", "APOE")  
+
+# Ver qué genes de interés para Alzheimer están presentes en genes_comunes_all
+genes_presentes <- intersect(genes_alzheimer, genes_comunes_all)
+
+# Mostrar resultado
+cat("Genes de Alzheimer presentes en genes_comunes_all:\n")
+print(genes_presentes)
+
+# Número de coincidencias
+cat("Número total:", length(genes_presentes), "genes\n")
+```
+
+Cual de estos genes predichos en `genes_ctgan` se corresponden con nuestras dianas terapéuticas iniciales.
+```{r}
+# Ver qué genes de interés para Alzheimer están presentes en genes_ctgan
+genes_presentes <- intersect(genes_alzheimer, genes_ctgan)
+
+# Mostrar resultado
+cat("Genes de Alzheimer presentes en genes_ctgan:\n")
+print(genes_presentes)
+
+# Número de coincidencias
+cat("Número total:", length(genes_presentes), "genes\n")
+```
+
+
+**Tabla más adecuada**
+```{r}
+# Función auxiliar para mostrar todos o una vista previa de los genes
+formatear_genes <- function(lista_genes, vista = "completa", n = 3) {
+  if (length(lista_genes) == 0) return(NA)
+  if (vista == "preview") {
+    return(paste0(paste(lista_genes[1:min(n, length(lista_genes))], collapse = ", "), ", ..."))
+  } else {
+    return(paste(lista_genes, collapse = ", "))
+  }
+}
+
+# Crear tabla resumen personalizada
+tabla_resumen <- data.frame(
+  Modelo = c("WGAN_GP_gcn", "CTGAN_gcn", "SMOTE_gcn", "Común a los 3"),
+  N_Predicciones = c(
+    length(genes_wgan),
+    length(genes_ctgan),
+    length(genes_smote),
+    length(genes_comunes_all)
+  ),
+  Genes = c(
+    formatear_genes(genes_wgan),
+    formatear_genes(genes_ctgan, vista = "preview"),
+    formatear_genes(genes_smote),
+    formatear_genes(genes_comunes_all)
+  ),
+  stringsAsFactors = FALSE
+)
+
+# Ver tabla
+print(tabla_resumen)
+
+# Crear objeto tabla resumen
+tabla <- tableGrob(tabla_resumen)
+
+# Convertir tabla en un objeto gráfico (grob)
+if (!dir.exists("Figuras_TFM")) dir.create("Figuras_TFM")
+
+# Guardar como imagen
+png("Figuras_TFM/resumen_modelos_gcn_Cadasil.png", width = 1200, height = 300)
+grid::grid.draw(tabla)
+dev.off() # Cierra el dispositivo gráfico activo en R
+
+```
+
+### 4.1.3 Predicciones genes Alzheimer
+```{r}
+# Convertir predicciones a factores legibles
+genes_ALZ$Pred_GCN_WGAN_GP <- factor(pred_gcn_WganGp_ALZ, levels = c(0,1), labels = c("No", "Sí"))
+genes_ALZ$Pred_GCN_CTGAN   <- factor(pred_gcn_CTgan_ALZ,   levels = c(0,1), labels = c("No", "Sí"))
+genes_ALZ$Pred_GCN_SMOTE   <- factor(pred_gcn_smote_ALZ,   levels = c(0,1), labels = c("No", "Sí"))
+
+# Obtener los genes predichos como diana por cada modelo
+genes_wgan  <- genes_ALZ %>% filter(Pred_GCN_WGAN_GP == "Sí") %>% pull(Gene)
+genes_ctgan <- genes_ALZ %>% filter(Pred_GCN_CTGAN   == "Sí") %>% pull(Gene)
+genes_smote <- genes_ALZ %>% filter(Pred_GCN_SMOTE   == "Sí") %>% pull(Gene)
+
+# Intersecciones
+genes_comunes_all  <- Reduce(intersect, list(genes_wgan, genes_ctgan, genes_smote))  # los 3 modelos
+genes_comunes_w_s  <- intersect(genes_wgan, genes_smote)                             # WGAN + SMOTE
+genes_comunes_w_c  <- intersect(genes_wgan, genes_ctgan)                             # WGAN + CTGAN
+genes_comunes_s_c  <- intersect(genes_smote, genes_ctgan)                            # SMOTE + CTGAN
+
+# Genes únicos de cada modelo
+genes_only_wgan  <- setdiff(genes_wgan, union(genes_ctgan, genes_smote))
+genes_only_ctgan <- setdiff(genes_ctgan, union(genes_wgan, genes_smote))
+genes_only_smote <- setdiff(genes_smote, union(genes_wgan, genes_ctgan))
+
+# Crear tabla resumen
+tabla_resumen <- data.frame(
+  Modelo = c("WGAN_GP", "CTGAN", "SMOTE", "Común a los 3"),
+  N_Predicciones = c(
+    length(genes_wgan),
+    length(genes_ctgan),
+    length(genes_smote),
+    length(genes_comunes_all)
+  ),
+  Genes = c(
+    NA, NA, NA, paste(genes_comunes_all, collapse = ", ")
+  ),
+  stringsAsFactors = FALSE
+)
+
+# Ver tabla
+print(tabla_resumen)
+```
+
+
+Genes comunes
+```{r}
+genes_comunes_all
+```
+
+
+**Tabla más adecuada**
+```{r}
+# Función auxiliar para mostrar todos o una vista previa de los genes
+formatear_genes <- function(lista_genes, vista = "completa", n = 3) {
+  if (length(lista_genes) == 0) return(NA)
+  if (vista == "preview") {
+    return(paste0(paste(lista_genes[1:min(n, length(lista_genes))], collapse = ", "), ", ..."))
+  } else {
+    return(paste(lista_genes, collapse = ", "))
+  }
+}
+
+# Crear tabla resumen personalizada
+tabla_resumen <- data.frame(
+  Modelo = c("WGAN_GP_gcn", "CTGAN_gcn", "SMOTE_gcn", "Común a los 3"),
+  N_Predicciones = c(
+    length(genes_wgan),
+    length(genes_ctgan),
+    length(genes_smote),
+    length(genes_comunes_all)
+  ),
+  Genes = c(
+    formatear_genes(genes_wgan),
+    formatear_genes(genes_ctgan, vista = "preview"),
+    formatear_genes(genes_smote),
+    formatear_genes(genes_comunes_all)
+  ),
+  stringsAsFactors = FALSE
+)
+
+# Ver tabla
+print(tabla_resumen)
+
+# Crear objeto tabla resumen
+tabla <- tableGrob(tabla_resumen)
+
+# Convertir tabla en un objeto gráfico (grob)
+if (!dir.exists("Figuras_TFM")) dir.create("Figuras_TFM")
+
+# Guardar como imagen
+#png("Figuras_TFM/resumen_modelos_gcn_ALZ.png", width = 1200, height = 300)
+#grid::grid.draw(tabla)
+#dev.off() # Cierra el dispositivo gráfico activo en R
+
+```
+
+Cual de estos genes predichos se corresponden con nuestras dianas terapéuticas iniciales.
+```{r}
+# Genes diana del alzheimer
+genes_alzheimer <- c("APP", "MAPT", "APOE", "CD2AP", "CLU", "PICALM", "BIN1", "TREM2", "SOD1", "SORL1", "ABCA7", "ABCA1", "ADAMTS4", "GSK3B", "GRN", "PSAP", "ACHE", "CACNA1D", "CACNA1C", "BACE", "BACE1", "BACE2", "ASP2", "KIAA1149", "GRIA", "GRIA1", "GRIA4", "D2R", "DRD2 ", "HTR6", "PPARG", "TARDBP", "AGER", "MAO", "MAOA", "MAOB", "GRIN1", "GRIN2A", "GRIN2B", "GRIN2C", "GRIN2D", "GRIN3A", "GRIN3B", "NOTCH3", "PSAP", "PI3K", "Akt", "MAPK", "TGF", "APOE") 
+
+# Ver qué genes de interés para Alzheimer están presentes en genes_comunes_all
+genes_presentes <- intersect(genes_alzheimer, genes_comunes_all)
+
+# Mostrar resultado
+cat("Genes de Alzheimer presentes en genes_comunes_all:\n")
+print(genes_presentes)
+
+# Número de coincidencias
+cat("Número total:", length(genes_presentes), "genes\n")
+```
+
+## 4.2 Modelos Random Forest y Decision Tree
+
+En estos casos los modelos no parecen haber podido aprender adecuadamente la complejidad de los datos sintéticos creados mediante técnicas GAN. 
+
+Vamos a observar los resultados para estos modelos entrenados con datos sintéticos creados por SMOTE.
+
+### 4.2.1 Modelo Random Forest para SMOTE 
+```{r}
+# Convertir predicciones a factores legibles
+genes_ALZ_CADASIL$Pred_rf_SMOTE_ALZ_CADASIL <- factor(pred_rf_smote_ALZ_CADASIL, levels = c(0,1), labels = c("No", "Sí"))
+genes_CADASIL$Pred_rf_SMOTE_CADASIL <- factor(pred_rf_smote_CADASIL,   levels = c(0,1), labels = c("No", "Sí"))
+genes_ALZ$Pred_rf_SMOTE_ALZ   <- factor(pred_rf_smote_ALZ,   levels = c(0,1), labels = c("No", "Sí"))
+
+# Genes predichos como dianas en el conjunto combinado ALZ-CADASIL
+genes_pred_ALZ_CADASIL <- genes_ALZ_CADASIL %>%
+  filter(Pred_rf_SMOTE_ALZ_CADASIL == "Sí")
+
+# Genes predichos como dianas en CADASIL
+genes_pred_CADASIL <- genes_CADASIL %>%
+  filter(Pred_rf_SMOTE_CADASIL == "Sí")
+
+# Genes predichos como dianas en Alzheimer
+genes_pred_ALZ <- genes_ALZ %>%
+  filter(Pred_rf_SMOTE_ALZ == "Sí")
+
+# Ver cuántos genes se han predicho como dianas
+cat("Se han detectado", nrow(genes_pred_ALZ_CADASIL), "dianas terapéuticas. En un total de:", total_genes_ALZ_CADASIL, "\n")
+
+cat("Se han detectado", nrow(genes_pred_CADASIL), "dianas terapéuticas. En un total de:", total_genes_CADASIL, "\n")
+
+cat("Se han detectado", nrow(genes_pred_ALZ), "dianas terapéuticas. En un total de:", total_genes_ALZ, "\n")
+
+
+# Genes de interés
+genes_interes <- c("APP", "MAPT", "APOE", "CD2AP", "CLU", "PICALM", "BIN1", "TREM2", "SOD1", "SORL1", "ABCA7", "ABCA1", "ADAMTS4", "GSK3B", "GRN", "PSAP", "ACHE", "CACNA1D", "CACNA1C", "BACE", "BACE1", "BACE2", "ASP2", "KIAA1149", "GRIA", "GRIA1", "GRIA4", "D2R", "DRD2 ", "HTR6", "PPARG", "TARDBP", "AGER", "MAO", "MAOA", "MAOB", "GRIN1", "GRIN2A", "GRIN2B", "GRIN2C", "GRIN2D", "GRIN3A", "GRIN3B", "NOTCH3", "PSAP", "PI3K", "Akt", "MAPK", "TGF", "APOE")  
+
+
+
+# Comparar conjuntos con la lista de genes de interés
+# ALZ-CADASIL
+genes_present_ALZ_CADASIL <- genes_pred_ALZ_CADASIL %>%
+  filter(Gene %in% genes_interes)
+
+# CADASIL
+genes_present_CADASIL <- genes_pred_CADASIL %>%
+  filter(Gene %in% genes_interes)
+
+# ALZHEIMER
+genes_present_ALZ <- genes_pred_ALZ %>%
+  filter(Gene %in% genes_interes)
+
+
+cat("Genes de interés en ALZ-CADASIL:", nrow(genes_present_ALZ_CADASIL), "\n")
+print(genes_present_ALZ_CADASIL$Gene)
+
+cat("\nGenes de interés en CADASIL:", nrow(genes_present_CADASIL), "\n")
+print(genes_present_CADASIL$Gene)
+
+cat("\nGenes de interés en ALZHEIMER:", nrow(genes_present_ALZ), "\n")
+print(genes_present_ALZ$Gene)
+
+```
+
+Llaman la atencion los resultados. 
+
+**Tabla más adecuada**
+```{r}
+library(gridExtra)
+library(grid)
+library(ggplot2)
+
+# Crear un dataframe resumen
+(tabla_resumen <- data.frame(
+  Conjunto = c("ALZ-CADASIL", "CADASIL", "ALZ"),
+  N_Genes_Predichos = c(
+    nrow(genes_present_ALZ_CADASIL),
+    nrow(genes_present_CADASIL),
+    nrow(genes_present_ALZ)
+  ),
+  Genes_Interes = c(
+    paste(genes_present_ALZ_CADASIL$Gene, collapse = ", "),
+    paste(genes_present_CADASIL$Gene, collapse = ", "),
+    paste(genes_present_ALZ$Gene, collapse = ", ")
+  ),
+  stringsAsFactors = FALSE
+))
+
+# Crear la tabla grob
+tabla_grob <- tableGrob(tabla_resumen, rows = NULL)
+
+# Crear carpeta de salida si no existe
+if (!dir.exists("Figuras_tfm")) {
+  dir.create("Figuras_tfm")
+}
+
+# Exportar a PNG
+png("Figuras_tfm/genes_interes_rf_smote.png", width = 1400, height = 400)
+grid.draw(tabla_grob)
+dev.off()
+
+
+```
+
+
+### 4.2.1 Modelo Decision Tree para SMOTE 
+```{r}
+# Convertir predicciones a factores legibles
+genes_ALZ_CADASIL$Pred_dt_SMOTE_ALZ_CADASIL <- factor(pred_dt_smote_ALZ_CADASIL, levels = c("Class_0","Class_1"), labels = c("No", "Sí"))
+genes_CADASIL$Pred_dt_SMOTE_CADASIL <- factor(pred_dt_smote_CADASIL,   levels = c("Class_0","Class_1"), labels = c("No", "Sí"))
+genes_ALZ$Pred_dt_SMOTE_ALZ   <- factor(pred_dt_smote_ALZ,   levels = c("Class_0","Class_1"), labels = c("No", "Sí"))
+
+# Genes predichos como dianas en el conjunto combinado ALZ-CADASIL
+genes_pred_ALZ_CADASIL <- genes_ALZ_CADASIL %>%
+  filter(Pred_dt_SMOTE_ALZ_CADASIL == "Sí")
+
+# Genes predichos como dianas en CADASIL
+genes_pred_CADASIL <- genes_CADASIL %>%
+  filter(Pred_dt_SMOTE_CADASIL == "Sí")
+
+# Genes predichos como dianas en Alzheimer
+genes_pred_ALZ <- genes_ALZ %>%
+  filter(Pred_dt_SMOTE_ALZ == "Sí")
+
+# Ver cuántos genes se han predicho como dianas
+cat("Se han detectado", nrow(genes_pred_ALZ_CADASIL), "genes de interés. En un total de:", total_genes_ALZ_CADASIL, "\n")
+
+cat("Se han detectado", nrow(genes_pred_CADASIL), "genes de interés. En un total de:", total_genes_CADASIL, "\n")
+
+cat("Se han detectado", nrow(genes_pred_ALZ), "genes de interés. En un total de:", total_genes_ALZ, "\n")
+
+# Genes de interés
+genes_interes <-  c("APP", "MAPT", "APOE", "CD2AP", "CLU", "PICALM", "BIN1", "TREM2", "SOD1", "SORL1", "ABCA7", "ABCA1", "ADAMTS4", "GSK3B", "GRN", "PSAP", "ACHE", "CACNA1D", "BACE", "BACE1", "BACE2", "ASP2", "KIAA1149", "GRIA", "GRIA1", "GRIA4", "D2R", "DRD2 ", "HTR6", "PPARG", "TARDBP", "AGER", "MAO", "MAOA", "MAOB", "GRIN1", "GRIN2A", "GRIN2B", "GRIN2C", "GRIN2D", "GRIN3A", "GRIN3B", "NOTCH3", "PSAP", "PI3K", "Akt", "MAPK") 
+
+# Comparar conjuntos con la lista de genes de interés
+# ALZ-CADASIL
+genes_present_ALZ_CADASIL <- genes_pred_ALZ_CADASIL %>%
+  filter(Gene %in% genes_interes)
+
+# CADASIL
+genes_present_CADASIL <- genes_pred_CADASIL %>%
+  filter(Gene %in% genes_interes)
+
+# ALZHEIMER
+genes_present_ALZ <- genes_pred_ALZ %>%
+  filter(Gene %in% genes_interes)
+
+
+cat("Genes de interés en ALZ-CADASIL:", nrow(genes_present_ALZ_CADASIL), "\n")
+print(genes_present_ALZ_CADASIL$Gene)
+
+cat("\nGenes de interés en CADASIL:", nrow(genes_present_CADASIL), "\n")
+print(genes_present_CADASIL$Gene)
+
+cat("\nGenes de interés en ALZHEIMER:", nrow(genes_present_ALZ), "\n")
+print(genes_present_ALZ$Gene)
+
+```
+
+Verwaerde, P., & Defert, O. (2025). AZP2006 (Ezeprogind®): a Promising New Drug Candidate in the Battle Against Neurodegenerative Diseases. ChemMedChem, e202400891.<https://doi.org/10.1002/cmdc.202400891> 
+
+**Tabla más adecuada**
+```{r}
+library(gridExtra)
+library(grid)
+library(ggplot2)
+
+# Crear un dataframe resumen
+(tabla_resumen <- data.frame(
+  Conjunto = c("ALZ-CADASIL", "CADASIL", "ALZ"),
+  N_Genes_Predichos = c(
+    nrow(genes_present_ALZ_CADASIL),
+    nrow(genes_present_CADASIL),
+    nrow(genes_present_ALZ)
+  ),
+  Genes_Interes = c(
+    paste(genes_present_ALZ_CADASIL$Gene, collapse = ", "),
+    paste(genes_present_CADASIL$Gene, collapse = ", "),
+    paste(genes_present_ALZ$Gene, collapse = ", ")
+  ),
+  stringsAsFactors = FALSE
+))
+
+# Crear la tabla grob
+tabla_grob <- tableGrob(tabla_resumen, rows = NULL)
+
+# Crear carpeta de salida si no existe
+if (!dir.exists("Figuras_tfm")) {
+  dir.create("Figuras_tfm")
+}
+
+# Exportar a PNG
+png("Figuras_tfm/genes_interes_dt_smote.png", width = 1400, height = 400)
+grid.draw(tabla_grob)
+dev.off()
+
+
+```
+
+
+# 5. Centralidad de los genes obtenidos
+
+Función para calcular si el valor de cada métrica supera el percentil 75.
+```{r}
+evaluar_centralidad_genes <- function(df_caract, genes_interes) {
+  # Crear dataframe base con los genes de interés
+  df_genes_logicos <- data.frame(Gene = genes_interes)
+  
+  # Calcular percentiles 75 para cada métrica (ignorando la columna Gene)
+  percentiles <- apply(df_caract[, -1], 2, quantile, probs = 0.75, na.rm = TRUE)
+  
+  # Por cada métrica, calcular si el valor supera el percentil 75
+  for (metric in names(percentiles)) {
+    valores_metric <- df_caract[df_caract$Gene %in% genes_interes, c("Gene", metric)]
+    
+    # Reordenar para que coincida con genes_interes
+    valores_metric <- valores_metric[match(genes_interes, valores_metric$Gene), ]
+    
+    # Añadir columna lógica
+    df_genes_logicos[[paste0(metric)]] <- valores_metric[[metric]] > percentiles[[metric]]
+  }
+  
+  return(df_genes_logicos)
+}
+```
+
+Función para calcular la proporción media de TRUE para el total de variables
+```{r}
+calcular_proporcion_true <- function(df_resultado) {
+  # Verifica que la primera columna sea 'Gene'
+  if (!"Gene" %in% names(df_resultado)) {
+    stop("El data.frame debe tener una columna 'Gene'")
+  }
+  
+  # Seleccionar solo columnas lógicas (excluyendo la columna Gene)
+  logical_cols <- sapply(df_resultado[, -1], is.logical)
+  n_vars <- sum(logical_cols)  # Número de métricas
+  
+  # Calcular número de TRUE por fila
+  df_resultado$Num_TRUE <- rowSums(df_resultado[, -1][, logical_cols])
+  
+  # Calcular proporción
+  df_resultado$Proporcion_TRUE <- df_resultado$Num_TRUE / n_vars
+  
+  # Calcular la media total
+  media <- mean(df_resultado$Proporcion_TRUE, na.rm = TRUE)
+  
+  # Devolver lista con el dataframe y la media
+  return(list(
+    resultado_extendido = df_resultado,
+    media_proporcion = media
+  ))
+}
+
+```
+
+
+```{r}
+calcular_proporcion_true <- function(df_resultado) {
+  # Verifica que la primera columna sea 'Gene'
+  if (!"Gene" %in% names(df_resultado)) {
+    stop("El data.frame debe tener una columna 'Gene'")
+  }
+  
+  # Seleccionar columnas lógicas (ignorando la primera)
+  logical_cols <- sapply(df_resultado[, -1], is.logical)
+  n_vars <- sum(logical_cols)
+  
+  # Calcular número y proporción de TRUE por gen
+  df_resultado$Num_TRUE <- rowSums(df_resultado[, -1][, logical_cols])
+  df_resultado$Proporcion_TRUE <- df_resultado$Num_TRUE / n_vars
+  
+  # Ordenar por proporción descendente
+  df_resultado_ordenado <- df_resultado[order(-df_resultado$Proporcion_TRUE), ]
+  
+  # Calcular media general
+  media <- mean(df_resultado_ordenado$Proporcion_TRUE, na.rm = TRUE)
+  
+  # Devolver resultados
+  return(list(
+    resultado_ordenado = df_resultado_ordenado,
+    media_proporcion = media
+  ))
+}
+
+
+```
+
+
+
+## 5.1 Genes Alzheimer-CADASIL
+
+```{r}
+genes_interes <- c("ISM2", "CARF", "RABGGTA", "TLR3", "WDFY3", "TSPAN18", "SHISA6")
+
+# Aplicar la función a df_caract_CADASIL
+(resultado_Alz_CADASIL <- evaluar_centralidad_genes(df_caract_ALZ_CADASIL, genes_interes))
+
+```
+
+```{r}
+# Proporcion media de TRUE
+resprop_alz_cad <- calcular_proporcion_true(resultado_Alz_CADASIL)
+
+# Ver media global
+resprop_alz_cad$media_proporcion
+```
+
+```{r}
+library(ggplot2)
+
+(p <- ggplot(resprop_alz_cad$resultado_ordenado, aes(x = reorder(Gene, Proporcion_TRUE), y = Proporcion_TRUE)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  theme_minimal(base_size = 13) +
+  labs(title = "Proporción de métricas en percentil 75 (Alzheimer-CADASIL)",
+       x = "Gen", y = "Proporción") +
+  geom_text(aes(label = round(Proporcion_TRUE, 2)), hjust = -0.1, size = 3.5) +
+  ylim(0, 1.05))
+
+# Guardar
+ggsave("Figuras_tfm/proporcion_metricas_Alz_CADASIL.png", plot = p, width = 8, height = 6, dpi = 300)
+
+```
+
+## 5.2 Genes CADASIL
+
+```{r}
+genes_interes <- c("M6PR", "CFTR", "CX3CL1", "CD74", "FKBP4", "XYLT2", "RB1CC1",
+  "CHPF2", "TMEM132A", "CD4", "ICAM3", "DVL2", "CD22", "GABARAPL2",
+  "NFE2L3", "LMCD1", "RTN4R", "ITGA3", "NGFR", "MRPS34", "TNS1",
+  "ASNS", "REXO1", "PDRG1", "PYCR1", "SLFN11", "SYDE1", "BUD23"
+)
+
+# Aplicar la función a df_caract_CADASIL
+(resultado_CADASIL <- evaluar_centralidad_genes(df_caract_CADASIL, genes_interes))
+
+
+
+```
+
+
+```{r}
+# Proporcion media de TRUE
+resprop_cad <- calcular_proporcion_true(resultado_CADASIL)
+
+# Ver media global
+resprop_cad$media_proporcion
+```
+
+```{r}
+library(ggplot2)
+
+(p <- ggplot(resprop_cad$resultado_ordenado, aes(x = reorder(Gene, Proporcion_TRUE), y = Proporcion_TRUE)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  theme_minimal(base_size = 13) +
+  labs(title = "Proporción de métricas en percentil 75 (CADASIL)",
+       x = "Gen", y = "Proporción") +
+  geom_text(aes(label = round(Proporcion_TRUE, 2)), hjust = -0.1, size = 3.5) +
+  ylim(0, 1.05))
+
+# Guardar
+ggsave("Figuras_tfm/proporcion_metricas_CADASIL.png", plot = p, width = 8, height = 6, dpi = 300)
+
+```
+
+
+## 5.3 Genes Alzheimer
+
+```{r}
+genes_interes <- c(
+  "APP", "WWOX", "MDFI", "UBB", "ATG12", "ZDHHC23", "SPIB", "CAPZA1", "PPIA", "RAB8B",
+  "EID1", "CSNK2A2", "PLEKHO1", "RGS2", "SNAPIN", "Dlg4", "ADAMTS1", "TIMP2", "FN1", "PCNT",
+  "PPP3R1", "ABI3", "CAMK2G", "TOLLIP", "NCR3", "AMBP", "C1QBP", "RAD50", "EREG", "CUL4B",
+  "SWE1", "GSPT1", "GYS1", "Ctnna2", "MLLT1", "NUTM1", "MYO1C", "ATP5C1", "LSM12", "ATG13",
+  "BCL10", "SMURF1", "ANKLE2", "CEP350", "ACTBL2", "DSG1", "FLOT2", "PBXIP1", "ASRGL1", "AATK",
+  "VPS36", "DSC1", "TPI1", "RPL8", "SCRIB", "OAS2", "PRDX5", "TASP1", "IKBIP", "GOLGA4",
+  "FAM32A", "LARP1B", "POGK", "HIST2H2AA3", "HSPB7", "GNAZ", "TXNDC5", "ADAD2", "HAVCR2", "PBRM1",
+  "SPRR4", "SSU72", "CUBN", "GARNL3", "PSKH2", "PIM3", "TESK1", "MYLK3", "STK38L", "CAMK1G",
+  "STK32B", "PASK", "ZC3H15", "SLIRP", "MPHOSPH10", "REEP1", "Smurf2", "SH2D5", "HUNK", "GJA9",
+  "GIGYF2", "PDRG1", "MTNR1A", "Arf1", "SPICE1", "SLC23A3", "Rnf111", "PLA2G4B", "RGS16", "ALMS1",
+  "KIAA0195", "NSG1", "CHD2", "CCM2", "APOBEC3C", "KIAA1429", "AARS2", "NUCB2", "TDO2", "ST8SIA5",
+  "HXT3", "THS1", "RHO5", "RPL7B", "ATF6B", "TMEM164", "MTCH1", "TM2D3", "DSE", "TMEM205",
+  "PIGU", "SLAMF7", "TYW1", "SUMF2", "TNFAIP1", "IDS", "FAM170A", "AKR1D1", "CBWD1", "APOL2",
+  "SYDE2", "BCAT1", "FGF10", "KIRREL2", "TANC2", "FAM91A1", "LPAR1", "CCDC94", "HIBCH", "AUNIP",
+  "Cep135", "Tmed10", "Klhl21", "Rab11a", "Flot1", "Lrrcc1", "EXOC3L2", "GDF11", "CHPT1", "IFNE",
+  "VWA3B", "SGPP1", "ZNF679", "Dnajb6", "Dnajc9", "KIAA1715", "PYHIN1", "L2HGDH", "ZCCHC3", "SLC25A52","Tmem65", "ilv5", "rpl8", "rps27", "SPAC23D3.12", "smd1", "met11", "lsd90", "HIV2gp4", "Hnrnpa1","H2afj", "Fkbp2", "Atp5o", "NID1", "OBSCN", "TMIE", "CUTC", "CHRNB4", "PNLIPRP1", "ZNF526","MIR29B2", "PLEKHG6", "HEBP2", "CARNS1", "ARHGAP11B", "NGRN", "echA1", "PRICKLE1", "DYNC2H1", "RFT1","MB21D2", "IGKV4-1", "MIEN1", "SOSTDC1", "TSEN15", "COG8", "GPC5", "ASIC2","GZMH", "SLC22A15","DEFB107A", "NKAIN1", "FUT7", "EPHX4", "SGCA", "PHF11", "KCNK4", "ADORA2B", "TANGO6", "VWDE","RHO2", "SHPK", "CCNYL2", "PKDREJ", "NLRP13", "GALT", "DPH7", "NAA16", "ARPIN", "IGKV2D-24","E3L", "ADIPOR2", "TIPARP", "KIF13A", "ZNF260", "EPHA10", "EPHA6", "S100A12", "KIAA2018", "NLRP6","MBD6", "MBD5", "vIRF-2", "E1", "ZCCHC4", "MIS18A", "ZNF155", "CYTL1","C2orf71", "PEX16","EIF4E3", "CCDC144A", "WDFY4", "CDH4", "FALEC", "SV2C", "TOA1"
+)
+
+
+# Aplicar la función a df_caract_CADASIL
+(resultado_Alz <- evaluar_centralidad_genes(df_caract_ALZ, genes_interes))
+
+```
+
+
+```{r}
+# Proporcion media de TRUE
+resprop_alz <- calcular_proporcion_true(resultado_Alz)
+
+# Ver media global
+resprop_alz$media_proporcion
+```
+
+```{r}
+library(ggplot2)
+
+(p<- ggplot(resprop_alz$resultado_ordenado[resprop_alz$resultado_ordenado$Proporcion_TRUE > 0.6, ],
+       aes(x = reorder(Gene, Proporcion_TRUE), y = Proporcion_TRUE)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  theme_minimal(base_size = 13) +
+  labs(title = "Proporción de métricas en percentil 75 (Alzheimer)",
+       x = "Gen", y = "Proporción") +
+  geom_text(aes(label = round(Proporcion_TRUE, 2)), hjust = -0.1, size = 3.5) +
+  ylim(0, 1.05))
+
+# Guardar
+ggsave("Figuras_tfm/proporcion_metricas_Alzheimer.png", plot = p, width = 8, height = 6, dpi = 300)
+```
+
+## 5.4 Genes modelos Decision Tree y Random Forest
+
+**PARA el CONJUNTO ALZ-CADASIL**
+```{r}
+genes_interes <- c("GRIN3B", "CACNA1C", "BIN1", "PSAP")
+
+# Aplicar la función a df_caract_CADASIL
+(resultado_Dt_Rf <- evaluar_centralidad_genes(df_caract_ALZ_CADASIL, genes_interes))
+
+```
+
+```{r}
+# Proporcion media de TRUE
+respro_Dt_Rf <- calcular_proporcion_true(resultado_Dt_Rf)
+
+# Ver media global
+respro_Dt_Rf$media_proporcion
+```
+
+```{r}
+library(ggplot2)
+
+(p <- ggplot(respro_Dt_Rf$resultado_ordenado, aes(x = reorder(Gene, Proporcion_TRUE), y = Proporcion_TRUE)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  theme_minimal(base_size = 13) +
+  labs(title = "Proporción de métricas en percentil 75 (Alzheimer-CADASIL)",
+       x = "Gen", y = "Proporción") +
+  geom_text(aes(label = round(Proporcion_TRUE, 2)), hjust = -0.1, size = 3.5) +
+  ylim(0, 1.05))
+
+# Guardar
+ggsave("Figuras_tfm/proporcion_metricas_Dt_RF.png", plot = p, width = 8, height = 6, dpi = 300)
+
+```
+
+**PARA el CONJUNTO CADASIL**
+```{r}
+genes_interes <- c("GRIN3B", "CACNA1C", "BIN1", "PSAP")
+
+# Aplicar la función a df_caract_CADASIL
+(resultado_Dt_Rf_cad <- evaluar_centralidad_genes(df_caract_CADASIL, genes_interes))
+
+```
+
+```{r}
+# Proporcion media de TRUE
+respro_Dt_Rf_cad <- calcular_proporcion_true(resultado_Dt_Rf_cad)
+
+# Ver media global
+respro_Dt_Rf_cad$media_proporcion
+```
+
+```{r}
+library(ggplot2)
+
+(p <- ggplot(respro_Dt_Rf_cad$resultado_ordenado, aes(x = reorder(Gene, Proporcion_TRUE), y = Proporcion_TRUE)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  theme_minimal(base_size = 13) +
+  labs(title = "Proporción de métricas en percentil 75 (Alzheimer-CADASIL)",
+       x = "Gen", y = "Proporción") +
+  geom_text(aes(label = round(Proporcion_TRUE, 2)), hjust = -0.1, size = 3.5) +
+  ylim(0, 1.05))
+
+# Guardar
+ggsave("Figuras_tfm/proporcion_metricas_Dt_RF_CAD.png", plot = p, width = 8, height = 6, dpi = 300)
+
+```
+
+# 6. Obtener otros Gráficos Relevantes
+
+```{r eval=FALSE, include=FALSE}
+library(dplyr)
+library(igraph)
+library(ggraph)
+library(ggplot2)
+
+# Paso 1: Unificar datasets
+ppi_all <- bind_rows(
+  df_ppi_Alz %>% mutate(Dataset = "ALZ"),
+  df_ppi_CADASIL %>% mutate(Dataset = "CADASIL"),
+  df_ppi_ALZ_CADASIL %>% mutate(Dataset = "BOTH")
+)
+
+# Paso 2: Crear grafo completo
+g_full <- graph_from_data_frame(ppi_all[, c("Gene_A", "Gene_B")], directed = FALSE)
+
+# Paso 3: Calcular grado y seleccionar los 100 genes más conectados
+top_genes <- names(sort(degree(g_full), decreasing = TRUE))[1:500]
+
+# Paso 4: Filtrar aristas que solo conectan genes del top 500
+ppi_top <- ppi_all %>%
+  filter(Gene_A %in% top_genes & Gene_B %in% top_genes)
+
+# Paso 5: Crear grafo filtrado
+g_top <- graph_from_data_frame(ppi_top[, c("Gene_A", "Gene_B")], directed = FALSE)
+
+# Paso 6: Reasignar etiquetas de grupo para colorear
+genes_ALZ <- unique(c(df_ppi_Alz$Gene_A, df_ppi_Alz$Gene_B))
+genes_CADASIL <- unique(c(df_ppi_CADASIL$Gene_A, df_ppi_CADASIL$Gene_B))
+
+V(g_top)$group <- sapply(V(g_top)$name, function(gene) {
+  if (gene %in% genes_ALZ & gene %in% genes_CADASIL) {
+    "COMÚN"
+  } else if (gene %in% genes_ALZ) {
+    "ALZ"
+  } else {
+    "CADASIL"
+  }
+})
+
+# Paso 7: Visualización
+ggraph(g_top, layout = "fr") +
+  geom_edge_link(alpha = 0.2) +
+  geom_node_point(aes(color = group), size = 3) +
+  geom_node_text(aes(label = name), repel = TRUE, size = 2.5) +
+  scale_color_manual(values = c(ALZ = "steelblue", CADASIL = "firebrick", COMÚN = "forestgreen")) +
+  theme_void() +
+  labs(title = "Top 500 genes más conectados: Interacciones ALZ vs CADASIL", color = "Grupo")
+
+# Exportar como PNG
+png("Figuras_tfm/Top_500_genes_ALZ_CADASIL.png", width = 1600, height = 1200, res = 150)
+
+# Código del gráfico
+ggraph(g_top, layout = "fr") +
+  geom_edge_link(alpha = 0.2) +
+  geom_node_point(aes(color = group), size = 3) +
+  geom_node_text(aes(label = name), repel = TRUE, size = 2.5) +
+  scale_color_manual(values = c(ALZ = "steelblue", CADASIL = "firebrick", COMÚN = "forestgreen")) +
+  theme_void() +
+  labs(title = "Top 500 genes más conectados: Interacciones ALZ vs CADASIL", color = "Grupo") +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,      # Centrado horizontal
+      face = "bold",    # Negrita
+      size = 16         # Tamaño (opcional)
+    )
+  )
+
+dev.off()
+```
+
+Cuando vas a los 500 genes se empiezan a ver genes exclusivos del CADASIL, es decir, tiene muchas rutas moleculares en común con el ALZHEIMER.
+
+**Representando los genes más conectados de cada grupo.**
+```{r eval=FALSE, include=FALSE}
+library(dplyr)
+library(igraph)
+library(ggraph)
+library(ggplot2)
+
+# Unificar datasets
+ppi_all <- bind_rows(
+  df_ppi_Alz %>% mutate(Dataset = "ALZ"),
+  df_ppi_CADASIL %>% mutate(Dataset = "CADASIL"),
+  df_ppi_ALZ_CADASIL %>% mutate(Dataset = "BOTH")
+)
+
+# Crear grafo completo
+g_full <- graph_from_data_frame(ppi_all[, c("Gene_A", "Gene_B")], directed = FALSE)
+
+# Genes por grupo
+genes_ALZ <- unique(c(df_ppi_Alz$Gene_A, df_ppi_Alz$Gene_B))
+genes_CADASIL <- unique(c(df_ppi_CADASIL$Gene_A, df_ppi_CADASIL$Gene_B))
+
+# Calcular grado
+deg_df <- data.frame(Gene = names(degree(g_full)), Degree = degree(g_full)) %>%
+  mutate(Group = case_when(
+    Gene %in% genes_ALZ & Gene %in% genes_CADASIL ~ "COMÚN",
+    Gene %in% genes_ALZ ~ "ALZ",
+    Gene %in% genes_CADASIL ~ "CADASIL",
+    TRUE ~ "OTRO"
+  ))
+
+# Seleccionar top genes por grupo manualmente
+top_alz <- deg_df %>% filter(Group == "ALZ") %>% slice_max(Degree, n = 40)
+top_cadasil <- deg_df %>% filter(Group == "CADASIL") %>% slice_max(Degree, n = 40)
+top_common <- deg_df %>% filter(Group == "COMÚN") %>% slice_max(Degree, n = 20)
+
+# Unir todos
+top_custom <- bind_rows(top_alz, top_cadasil, top_common)
+top_genes <- top_custom$Gene
+
+# Filtrar interacciones entre estos genes
+ppi_top <- ppi_all %>%
+  filter(Gene_A %in% top_genes & Gene_B %in% top_genes)
+
+# Crear grafo reducido
+g_top <- graph_from_data_frame(ppi_top[, c("Gene_A", "Gene_B")], directed = FALSE)
+
+# Añadir grupo
+V(g_top)$group <- deg_df$Group[match(V(g_top)$name, deg_df$Gene)]
+
+# Visualización
+ggraph(g_top, layout = "fr") +
+  geom_edge_link(alpha = 0.2, color = "grey60") +
+  geom_node_point(aes(color = group), size = 3) +
+  geom_node_text(aes(label = name), repel = TRUE, size = 2.5) +
+  scale_color_manual(
+    values = c(ALZ = "steelblue", CADASIL = "firebrick", COMÚN = "forestgreen")
+  ) +
+  theme_void() +
+  labs(
+    title = "Genes más conectados: Alzheimer, CADASIL y comunes",
+    color = "Grupo"
+  )
+
+# Exportar a PNG 
+png("Figuras_tfm/red_genes_ALZ_CADASIL.png", width = 1600, height = 1200, res = 150)
+
+ggraph(g_top, layout = "fr") +
+  geom_edge_link(alpha = 0.2, color = "grey60") +
+  geom_node_point(aes(color = group), size = 3) +
+  geom_node_text(aes(label = name), repel = TRUE, size = 2.5) +
+  scale_color_manual(
+    values = c(ALZ = "steelblue", CADASIL = "firebrick", COMÚN = "forestgreen")
+  ) +
+  theme_void() +
+  labs(
+    title = "Genes más conectados: Alzheimer, CADASIL y comunes",
+    color = "Grupo"
+  ) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,      # Centrado horizontal
+      face = "bold",    # Negrita
+      size = 16         # Tamaño (opcional)
+    )
+  )
+
+dev.off()
+```
+
+
+
+**Mismo Gráfico en 3D.**
+```{r eval=FALSE, include=FALSE}
+library(igraph)
+library(threejs)
+library(htmlwidgets)
+
+# Crear el grafo como antes (g_top ya debe estar definido)
+
+# Asignar color según grupo
+colors <- c("ALZ" = "steelblue", "CADASIL" = "firebrick", "COMÚN" = "forestgreen")
+V(g_top)$color <- colors[V(g_top)$group]
+
+# Visualización interactiva en 3D
+(graph_3d <-graphjs(
+  g_top,
+  vertex.color = V(g_top)$color,
+  vertex.label = V(g_top)$name,      # Mostrar nombres de genes
+  vertex.size = 0.4,                 # Tamaño pequeño de nodo
+  bg = "white",
+  main = "Redes PPI Alzheimer-CADASIL"
+))
+
+saveWidget(graph_3d, file = "Figuras_tfm/red_genes_ALZ_CADASIL_3D.html")
+
+```
+
+
+**Gráfico red PPI para Alzheimer**
+```{r}
+library(igraph)
+library(tidygraph)
+library(ggraph)
+library(dplyr)
+
+# 1. Crear objeto igraph desde df_ppi_ALZ
+# Suponiendo que los genes ya están como símbolos en Gene_A y Gene_B
+ppi_graph <- graph_from_data_frame(df_ppi_Alz, directed = FALSE)
+
+# 2. Calcular el grado de cada nodo
+node_degree <- degree(ppi_graph, mode = "all")
+
+# 3. Seleccionar los 60 nodos más conectados
+top_n <- 100
+top_nodes <- names(sort(node_degree, decreasing = TRUE))[1:top_n]
+
+# 4. Crear subgrafo con los nodos más conectados
+subgraph <- induced_subgraph(ppi_graph, vids = top_nodes)
+
+# 5. Convertir subgrafo a tidygraph y usar nombre del nodo como símbolo
+graph_tbl <- as_tbl_graph(subgraph) %>%
+  mutate(symbol = name)  # Aquí asumimos que `name` ya es el símbolo
+
+# 6. Graficar usando ggraph con layout Fruchterman-Reingold
+(p <- ggraph(graph_tbl, layout = "fr") + 
+  geom_edge_link(alpha = 0.3, color = "lightblue") +
+  geom_node_point(color = "steelblue", size = 5) +
+  geom_node_text(aes(label = symbol),
+                 repel = TRUE,
+                 size = 3.5,
+                 fontface = "bold",
+                 color = "darkgreen") +
+  theme_graph(base_family = "Arial") +
+  ggtitle("Red PPI Alzheimer – Top 100 genes más conectados"))
+
+```
+
+
+```{r}
+# Guardar como PNG
+ggsave("Figuras_tfm/ppi_alz_top60.png", plot = p, width = 10, height = 8, dpi = 300)
+```
+
+**COMPROBAR, EN UN TOP 100 CUANTOS Y CUÁLES COINCIDEN YA CON LOS GENES DE INTERÉS:** 
+```{r}
+# Obtener los símbolos (nombres) de los nodos en el subgrafo
+genes_en_subgrafo <- V(subgraph)$name
+
+# Lista de genes de interés
+genes_interes <- c("APP", "MAPT", "APOE", "CD2AP", "CLU", "PICALM", "BIN1", "TREM2", "SOD1", "SORL1", "ABCA7", "ABCA1", "ADAMTS4", "GSK3B", "GRN", "PSAP", "ACHE", "CACNA1D", "CACNA1C", "BACE", "BACE1", "BACE2", "ASP2", "KIAA1149", "GRIA", "GRIA1", "GRIA4", "D2R", "DRD2 ", "HTR6", "PPARG", "TARDBP", "AGER", "MAO", "MAOA", "MAOB", "GRIN1", "GRIN2A", "GRIN2B", "GRIN2C", "GRIN2D", "GRIN3A", "GRIN3B") 
+
+
+# Encontrar coincidencias
+intersect(genes_en_subgrafo, genes_interes)
+```
+
+
+COMPROBAR Número total de genes en comun entre alzheimer y cadasil (Formato Tabla)
+```{r}
+# Asegúrate de que ambos data frames estén cargados:
+# df_caract_ALZ y df_caract_CADASIL deben tener una columna llamada "gene"
+
+# Obtener vectores únicos de genes
+genes_alz <- unique(df_caract_ALZ$Gene)
+genes_cadasil <- unique(df_caract_CADASIL$Gene)
+
+# Calcular cantidades
+n_alz <- length(genes_alz)
+n_cadasil <- length(genes_cadasil)
+genes_comunes <- intersect(genes_alz, genes_cadasil)
+n_comunes <- length(genes_comunes)
+no_comunes <- n_alz - n_comunes
+
+# Crear data frame resumen
+resumen <- data.frame(
+  Conjunto = c("Alzheimer", "CADASIL", "Genes en común", "Genes No comunes"),
+  N_genes = c(n_alz, n_cadasil, n_comunes, no_comunes)
+)
+
+# Mostrar resultado
+print(resumen)
+
+```
+
+
+
+
+
+

@@ -1,0 +1,1741 @@
+---
+title: "TFM_2_ML"
+author: "Juan Manuel Sancho Romero"
+date: "2025-03-27"
+output:
+  html_document:
+    df_print: paged
+    toc: yes
+    toc_float: true
+    code_folding: show
+    theme: united
+    higlight: tango
+  pdf_document:
+    keep_tex: yes
+    toc: yes
+header-includes: \usepackage[spanish]{babel}
+params:
+  file1: caracteristics_ppi_ALZHEIMER.csv
+  folder.data: C:/Users/juanm/Desktop/MASTER_BIOINFORMATICA/0_TFM_Bioinf/TFM_Resultados
+  p.train: 0.75 # 75% de los datos para definir el conjunto de entrenamiento
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages, message=FALSE, warning=FALSE, include=FALSE}
+libraries <- c("ggplot2", "dplyr", "e1071", "gmodels",  "ROCR", "caret", "C50", "randomForest", "class", "klaR", "kernlab", "kableExtra", "DMwR", "ggfortify", "nortest", "dplyr")
+check.libraries <- is.element(libraries, installed.packages()[, 1])==FALSE
+libraries.to.install <- libraries[check.libraries]
+if (length(libraries.to.install!=0)) {
+  install.packages(libraries.to.install)
+}
+
+library("knitr")
+library("kableExtra")
+library("reticulate")
+library("ggplot2")
+library("dplyr")
+library("e1071")
+library("gmodels")
+library("ROCR")
+library("caret")
+
+# KNN
+library("class")
+
+# Naive-Bayes
+library("klaR")
+
+# SVM
+library("kernlab")
+
+# Tree
+library("C50")
+
+# Random Forest
+library("randomForest")
+
+```
+
+Establecer el entorno de `Pyhton` con `tensorFlow`, `Pytorch`, `Networkz` y otras librerías necesarias instaladas.
+```{r eval=FALSE, include=FALSE}
+reticulate::use_condaenv("tfm_ml", required = TRUE)
+```
+
+# 1. Exploración y Preparación de los Datos
+
+## 1.1 Exploración de los Datos
+
+**Importamos el fichero con los datos.**
+```{r, echo=FALSE}
+caracteristics_ppi_ALZ <- read.csv(
+  file.path(params$folder.data, params$file1), 
+  sep=",",            # Especifica que el separador de columnas es una coma
+  dec=".",            # Define que el separador decimal es un punto
+  header=TRUE,        # Indica que la primera fila contiene los nombres de las columnas
+  stringsAsFactors=FALSE # Evita que las columnas se conviertan en factores automáticamente
+)
+```
+
+**Primeras filas.** 
+```{r}
+head(caracteristics_ppi_ALZ)
+```
+
+**Estructura del "dataframe"**
+```{r}
+str(caracteristics_ppi_ALZ)
+```
+
+Por ahora vamos a quitar la columna que contiene el número de fármacos probados para ese gen por si fuera demasiado informativa para los modelos.
+```{r}
+caracteristics_ppi_ALZ <- caracteristics_ppi_ALZ[, !names(caracteristics_ppi_ALZ) %in% "Num_Drugs"]
+```
+
+**Resumen Estadístico.**
+```{r}
+summary(caracteristics_ppi_ALZ)
+```
+
+**Gráfico de Boxplot múltiple** para comparar las distribuciones de las distintas características.
+```{r}
+# Cargar librerías necesarias
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+# Convertir a formato largo (long format) para ggplot2
+df_long <- caracteristics_ppi_ALZ %>%
+  pivot_longer(cols = -Gene, names_to = "Metric", values_to = "Value")
+
+ggplot(df_long, aes(x = Metric, y = Value, fill = Metric)) +
+  geom_boxplot() +
+  scale_y_log10() +  # Aplica escala logarítmica para mejorar la visualización
+  labs(title = "Distribución de Variables PPI", x = "Métrica", y = "Valor (log10)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+# 1.2 Preparación de los Datos
+
+Para crear un buen conjunto de datos de entrenamiento se utilizarán técnicas de resampling y GANS para aumentar el número de dianas terapéuticas.
+
+**Los genes considerados dianas terapéuticas los incluimos en `df_genes_diana`.**
+```{r}
+# Crear un vector con los nombres de los genes
+genes_alzheimer <- c("APP", "MAPT", "APOE", "CD2AP", "CLU", "PICALM", "BIN1", "TREM2", "SOD1", "SORL1", "ABCA7", "ABCA1", "ADAMTS4", "GSK3B", "GRN", "PSAP", "ACHE", "CACNA1D", "CACNA1C", "BACE", "BACE1", "BACE2", "ASP2", "KIAA1149", "GRIA", "GRIA1", "GRIA4", "D2R", "DRD2 ", "HTR6", "PPARG", "TARDBP", "AGER", "MAO", "MAOA", "MAOB", "GRIN1", "GRIN2A", "GRIN2B", "GRIN2C", "GRIN2D", "GRIN3A", "GRIN3B") 
+
+# Convertir el vector en un dataframe
+df_genes_diana <- data.frame(Gene = genes_alzheimer)
+
+# Mostrar el dataframe
+print(df_genes_diana)
+
+```
+
+NOTA: "NMDAR": receptores NMDA (N-Methyl-D-Aspartate): GRIN1, GRIN2A, GRIN2B, GRIN2C, GRIN2D, GRIN3A, GRIN3B.
+
+**Creamos la columna de etiquetas `Therapeutic_Target` (0, 1) en `caracteristics_ppi_ALZ` a partir de `df_genes_diana`.** 
+```{r}
+# Cargar dplyr
+library(dplyr)
+
+# Agregar la columna Therapeutic_Target (1 si está en df_genes_diana, 0 si no)
+caracteristics_ppi_ALZ <- caracteristics_ppi_ALZ %>%
+  mutate(Therapeutic_Target = ifelse(Gene %in% df_genes_diana$Gene, 1, 0))
+
+# Verificar los primeros resultados
+head(caracteristics_ppi_ALZ)
+```
+
+
+**Contar Nº de dianas terapéuticas del dataset (Comprobación de que se ha realizado bien).**
+```{r}
+# Contar el número de dianas terapéuticas
+num_dianas <- sum(caracteristics_ppi_ALZ$Therapeutic_Target == 1)
+
+# Mostrar el resultado
+print(paste("Número de dianas terapéuticas en el dataset:", num_dianas))
+
+(caracteristics_ppi_ALZ[caracteristics_ppi_ALZ$Therapeutic_Target == 1, "Gene"])
+```
+No se ha encontrado: "D2R (DRD2)
+
+# 2. Synthetic Minority Over-sampling Technique (SMOTE) 
+
+SMOTE genera nuevos puntos interpolando entre ejemplos reales.
+<https://www.geeksforgeeks.org/how-to-use-smote-for-imbalanced-data-in-r/>
+```{r}
+library(smotefamily)
+library(caret)
+
+# Definir la semilla para reproducibilidad
+set.seed(123)
+
+# Asegurar que la variable objetivo es un factor
+caracteristics_ppi_ALZ$Therapeutic_Target <- as.factor(caracteristics_ppi_ALZ$Therapeutic_Target)
+
+# Extraer características predictoras y variable objetivo
+X <- caracteristics_ppi_ALZ[, !colnames(caracteristics_ppi_ALZ) %in% c("Gene", "Therapeutic_Target")]
+y <- caracteristics_ppi_ALZ$Therapeutic_Target
+
+# Aplicar SMOTE para balancear la clase minoritaria
+# dup_size controla cuánto se aumenta la clase minoritaria (por defecto 100% = dup_size 1)
+smote_result <- SMOTE(X, y, 
+                      K = 5,         # Se van a utilizar los 5 vecinos más cercanos
+                      dup_size = 50) # Se aumenta el número de ejemplos en un 50 con respecto al total
+
+# Reconstruir el dataset obtenido
+df_smote <- smote_result$data
+
+# Restaurar la variable objetivo como factor
+df_smote$class <- as.factor(df_smote$class)
+
+# Renombrar la columna de clase
+colnames(df_smote)[ncol(df_smote)] <- "Therapeutic_Target"
+
+# Verificar la nueva distribución de clases
+table(df_smote$Therapeutic_Target)
+
+```
+
+**Análisis general del resultado.**
+```{r}
+str(df_smote)
+summary(df_smote)
+anyNA(df_smote)  # ¿Hay NAs?
+```
+
+
+## 2.1 Conjunto de Prueba y Entrenamiento después de realizar `SMOTE`
+```{r}
+library(caret)
+
+# Semilla para reproducibilidad
+set.seed(123)
+
+# Crear partición estratificada (80% entrenamiento, 20% prueba)
+train_index <- createDataPartition(df_smote$Therapeutic_Target, p = 0.8, list = FALSE)
+
+# Dividir en conjuntos de entrenamiento y prueba
+df_train_smote <- df_smote[train_index, ]
+df_test_smote <- df_smote[-train_index, ]
+
+# Verificar la distribución de clases en cada conjunto
+print("Distribución en entrenamiento:")
+print(table(df_train_smote$Therapeutic_Target))
+
+print("Distribución en prueba:")
+print(table(df_test_smote$Therapeutic_Target))
+
+```
+
+
+## 2.2 Evaluación de las dianas terapéuticas simuladas con Smote
+
+### a) Comparación de las Distribuciones 
+
+#### Entre la Clase Diana Terapéutica y Diana No terapéutica  
+```{r}
+library(ggplot2)
+library(tidyr)  # pivot_longer está en tidyr, no en reshape2
+
+# Convertir a formato largo excluyendo la variable objetivo
+df_long <- df_smote %>%
+  pivot_longer(cols = !Therapeutic_Target, names_to = "Metric", values_to = "Value")
+
+# Graficar la distribución de cada característica
+ggplot(df_long, aes(x = Value, fill = Therapeutic_Target)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~ Metric, scales = "free") +
+  theme_minimal() +
+  ggtitle("Distribuciones Clase Diana Terapéutica vs Diana No terapéutica")
+
+
+```
+
+**Graficamos en escala logarítmica para poder observar mejor las distribuciones.**
+```{r}
+(g_smote_DT_NODT <- ggplot(df_long, aes(x = Value, fill = Therapeutic_Target)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~ Metric, scales = "free") +
+  scale_x_log10() +  # Escala logarítmica en X
+  theme_minimal() +
+  ggtitle("Distribuciones de la Clase Diana Terapéutica vs Diana No terapéutica"))
+
+```
+Exportar como png.
+```{r}
+ggsave("Figuras_tfm/Smote_DT_NODT.png", plot = g_smote_DT_NODT, width = 8, height = 6, dpi = 300)
+```
+
+#### Entre Dianas Terapéuticas Reales vs Sintéticas.
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# Filtrar solo los casos donde Therapeutic_Target = 1
+df_real <- caracteristics_ppi_ALZ %>% 
+  filter(Therapeutic_Target == 1) %>% 
+  mutate(Source = "Real")
+
+df_synthetic <- df_smote %>% 
+  filter(Therapeutic_Target == 1) %>% 
+  mutate(Source = "SMOTE")
+
+# Unir ambos conjuntos
+df_combined <- bind_rows(df_real, df_synthetic)
+
+# Eliminar columna Gene si 
+df_combined <- dplyr::select(df_combined, -any_of("Gene"))
+
+
+# Convertir a formato largo para ggplot2
+df_long <- df_combined %>%
+  pivot_longer(cols = -c(Therapeutic_Target, Source), names_to = "Feature", values_to = "Value")
+
+# Graficar la distribución de cada variable
+(g_smote_Real <- ggplot(df_long, aes(x = Value, fill = Source)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~ Feature, scales = "free") +
+  theme_minimal() +
+  ggtitle("Distribuciones entre genes reales vs sintéticos"))
+
+
+```
+
+Exportar como png.
+```{r}
+ggsave("Figuras_tfm/Smote_Real.png", plot = g_smote_Real, width = 8, height = 6, dpi = 300)
+```
+
+
+### b) Test Estadístico para evaluar la semejanza entre distribuciones
+
+#### Entre la Clase Diana Terapéutica y Diana No terapéutica  
+```{r}
+# Librerías necesarias
+library(dplyr)
+library(nortest)  # Para Anderson-Darling
+
+# Asegurar que Therapeutic_Target es factor
+df_smote$Therapeutic_Target <- as.factor(df_smote$Therapeutic_Target)
+
+# Seleccionar solo las variables numéricas (excluyendo Therapeutic_Target)
+num_vars <- df_smote[, sapply(df_smote, is.numeric)]
+
+# Inicializar lista para almacenar resultados
+results <- data.frame(Variable = character(), Test = character(), P_value = numeric())
+
+# Iterar sobre todas las variables numéricas
+for (var in colnames(num_vars)) {
+  
+  # Obtener datos de cada clase
+  group_0 <- df_smote[[var]][df_smote$Therapeutic_Target == "0"]
+  group_1 <- df_smote[[var]][df_smote$Therapeutic_Target == "1"]
+  
+  # Verificar normalidad con Shapiro-Wilk (si la muestra tiene tamaño adecuado)
+  p_val_0 <- if (length(group_0) >= 3 & length(group_0) <= 5000) shapiro.test(group_0)$p.value else ad.test(group_0)$p.value
+  p_val_1 <- if (length(group_1) >= 3 & length(group_1) <= 5000) shapiro.test(group_1)$p.value else ad.test(group_1)$p.value
+  
+  # Si ambos grupos son normales (p > 0.05), usar t-test, de lo contrario Mann-Whitney
+  if (p_val_0 > 0.05 & p_val_1 > 0.05) {
+    test_result <- t.test(df_smote[[var]] ~ df_smote$Therapeutic_Target)
+    test_name <- "T-test"
+  } else {
+    test_result <- wilcox.test(df_smote[[var]] ~ df_smote$Therapeutic_Target)
+    test_name <- "Mann-Whitney"
+  }
+  
+  # Guardar resultados
+  results <- rbind(results, data.frame(Variable = var, Test = test_name, P_value = test_result$p.value))
+}
+
+# Mostrar resultados ordenados por p-valor
+results <- results %>% arrange(P_value)
+print(results)
+
+```
+
+Test KS
+```{r}
+# Librerías necesarias
+library(dplyr)
+
+# Asegurar que Therapeutic_Target es factor
+df_smote$Therapeutic_Target <- as.factor(df_smote$Therapeutic_Target)
+
+# Seleccionar solo las variables numéricas (excluyendo Therapeutic_Target)
+num_vars <- df_smote[, sapply(df_smote, is.numeric)]
+
+# Inicializar lista para almacenar resultados
+results <- data.frame(Variable = character(), Test = character(), P_value = numeric())
+
+# Iterar sobre todas las variables numéricas
+for (var in colnames(num_vars)) {
+  
+  # Obtener datos de cada clase
+  group_0 <- df_smote[[var]][df_smote$Therapeutic_Target == "0"]
+  group_1 <- df_smote[[var]][df_smote$Therapeutic_Target == "1"]
+  
+  # Aplicar test KS
+  test_result <- ks.test(group_0, group_1)
+  
+  # Guardar resultados
+  results <- rbind(results, data.frame(Variable = var, Test = "Kolmogorov–Smirnov", P_value = test_result$p.value))
+}
+
+# Mostrar resultados ordenados por p-valor
+results <- results %>% arrange(P_value)
+print(results)
+
+```
+
+
+
+#### Entre Dianas Terapéuticas Reales vs Sintéticas.
+```{r}
+# Cargar librerías necesarias
+library(dplyr)
+
+# Filtrar solo las dianas terapéuticas (Clase 1) en cada conjunto
+df_real <- caracteristics_ppi_ALZ %>% filter(Therapeutic_Target == 1)
+df_synthetic <- df_smote %>% filter(Therapeutic_Target == 1)
+
+# Seleccionar solo las columnas numéricas para comparar
+num_vars <- setdiff(names(df_real), c("Therapeutic_Target", "Gene"))  # Excluir variables no numéricas
+
+# Crear una función para comparar cada variable entre datos reales y SMOTE
+compare_distributions <- function(var) {
+  real_values <- df_real[[var]]
+  synthetic_values <- df_synthetic[[var]]
+  
+  # Verificar normalidad
+  p_real <- shapiro.test(real_values)$p.value
+  p_synth <- shapiro.test(synthetic_values)$p.value
+  
+  # Seleccionar el test adecuado
+  if (p_real > 0.05 & p_synth > 0.05) {
+    test <- t.test(real_values, synthetic_values, var.equal = FALSE)
+    test_type <- "t-test"
+  } else {
+    test <- wilcox.test(real_values, synthetic_values)
+    test_type <- "Wilcoxon"
+  }
+  
+  return(data.frame(Variable = var, Test = test_type, p_value = test$p.value))
+}
+
+# Aplicar la comparación a todas las variables numéricas
+test_results <- lapply(num_vars, compare_distributions)
+
+# Convertir lista en data.frame
+test_results_df <- do.call(rbind, test_results)
+
+# Aplicar corrección de Bonferroni
+test_results_df$p_adjusted <- p.adjust(test_results_df$p_value, method = "bonferroni")
+
+# Mostrar los resultados
+print(test_results_df)
+
+
+```
+
+
+```{r}
+# Cargar librerías necesarias
+library(dplyr)
+
+# Filtrar solo las dianas terapéuticas (Clase 1) en cada conjunto
+df_real <- caracteristics_ppi_ALZ %>% filter(Therapeutic_Target == 1)
+df_synthetic <- df_smote %>% filter(Therapeutic_Target == 1)
+
+# Seleccionar solo las columnas numéricas (excluyendo columnas no numéricas)
+num_vars <- setdiff(names(df_real), c("Therapeutic_Target", "Gene"))
+
+# Crear función con test KS
+compare_distributions_ks <- function(var) {
+  real_values <- df_real[[var]]
+  synthetic_values <- df_synthetic[[var]]
+  
+  test <- ks.test(real_values, synthetic_values)
+  return(data.frame(Variable = var, Test = "Kolmogorov–Smirnov", p_value = test$p.value))
+}
+
+# Aplicar la comparación a todas las variables numéricas
+test_results <- lapply(num_vars, compare_distributions_ks)
+
+# Unir en un único data frame
+test_results_df <- do.call(rbind, test_results)
+
+# Aplicar corrección de Bonferroni
+test_results_df$p_adjusted <- p.adjust(test_results_df$p_value, method = "bonferroni")
+
+# Mostrar resultados ordenados por p-valor ajustado
+test_results_df <- test_results_df %>% arrange(p_adjusted)
+print(test_results_df)
+
+```
+
+
+Diferencia absoluta entre matrices de correlacion de reales vs sinteticas y Medida promedio de cuánto difieren las correlaciones
+```{r}
+# Filtrar genes reales y sintéticos (clase 1)
+real_data <- caracteristics_ppi_ALZ %>%
+  filter(Therapeutic_Target == 1) %>%
+  select(where(is.numeric))
+
+synth_data <- df_smote %>%
+  filter(Therapeutic_Target == 1) %>%
+  select(where(is.numeric))
+
+# Obtener nombres de columnas numéricas comunes
+common_vars <- intersect(colnames(real_data), colnames(synth_data))
+
+# Alinear los dataframes por columnas comunes
+real_aligned <- real_data[, common_vars]
+synth_aligned <- synth_data[, common_vars]
+
+# Calcular matrices de correlación (con control de NAs)
+real_corr <- cor(real_aligned, use = "pairwise.complete.obs")
+synth_corr <- cor(synth_aligned, use = "pairwise.complete.obs")
+
+# Calcular diferencia absoluta
+diff_corr <- abs(real_corr - synth_corr)
+
+# Calcular norma Frobenius
+norm_diff <- sqrt(sum((real_corr - synth_corr)^2))
+
+# Calcular diferencia media
+mean_diff_corr <- mean(diff_corr)
+
+# Mostrar resultados
+cat("Norma Frobenius de diferencia:", round(norm_diff, 4), "\n")
+cat("Promedio de diferencia de correlación:", round(mean_diff_corr, 4), "\n")
+
+```
+
+
+### c) PCA
+
+#### Entre la Clase Diana Terapéutica y Diana No terapéutica  
+
+```{r}
+library(ggfortify)
+
+# Aplicar PCA
+pca_model <- prcomp(df_smote[, -which(colnames(df_train_smote) == "Therapeutic_Target")], scale = TRUE)
+
+# Visualizar los datos generados vs. reales
+autoplot(pca_model, data = df_smote, colour = "Therapeutic_Target") +
+  ggtitle("Distribución PCA de los datos reales y SMOTE")
+
+```
+
+
+#### Entre Dianas Terapéuticas Reales vs Sintéticas.
+
+**Análisis de 2 PC**
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# Filtrar solo las dianas terapéuticas (Clase 1)
+df_real <- caracteristics_ppi_ALZ %>% filter(Therapeutic_Target == 1)
+df_synthetic <- df_smote %>% filter(Therapeutic_Target == 1)
+
+# Agregar etiqueta de origen
+df_real$Source <- "Real"
+df_synthetic$Source <- "SMOTE"
+
+# Combinar ambos conjuntos
+df_combined <- bind_rows(df_real, df_synthetic)
+
+# Convertir Therapeutic_Target en factor y eliminar columnas no numéricas
+df_combined$Therapeutic_Target <- as.factor(df_combined$Therapeutic_Target)
+df_combined <- dplyr::select(df_combined, -Gene)  # Eliminar identificadores
+
+# Seleccionar solo variables numéricas
+df_pca <- df_combined %>% dplyr::select(where(is.numeric))
+
+# Escalar los datos para PCA
+df_pca_scaled <- scale(df_pca)
+
+# Aplicar PCA
+pca_model <- prcomp(df_pca_scaled, center = TRUE, scale. = TRUE)
+
+# Crear un data frame con coordenadas de PCA
+pca_df <- as.data.frame(pca_model$x)
+pca_df$Source <- df_combined$Source
+
+# Ajustar el tamaño de los puntos
+ggplot(pca_df, aes(x = PC1, y = PC2, color = Source)) +
+  geom_point(aes(size = ifelse(Source == "Real", 5, 2)), shape = 21, fill = "white", stroke = 1.2) +  
+  scale_color_manual(values = c("Real" = "red", "SMOTE" = "blue")) +
+  ggtitle("Distribución PCA: Datos Reales vs. SMOTE") +
+  theme_minimal()
+
+
+```
+
+Las Dianas terapéuticas reales se encuentran en las 3 primeras componentes principales.
+```{r}
+sum(pca_df$Source == "Real" & (pca_df$PC1 != 0 | pca_df$PC2 != 0 | pca_df$PC3 != 0))
+
+```
+
+**Análisis de 3 PC**
+```{r}
+library(plotly)
+library(dplyr)
+
+# Filtrar solo las dianas terapéuticas (Clase 1)
+df_real <- caracteristics_ppi_ALZ %>% filter(Therapeutic_Target == 1)
+df_synthetic <- df_smote %>% filter(Therapeutic_Target == 1)
+
+# Agregar etiqueta de origen
+df_real$Source <- "Real"
+df_synthetic$Source <- "SMOTE"
+
+# Combinar ambos conjuntos
+df_combined <- bind_rows(df_real, df_synthetic)
+
+# Convertir Therapeutic_Target en factor y eliminar columnas no numéricas
+df_combined$Therapeutic_Target <- as.factor(df_combined$Therapeutic_Target)
+df_combined <- dplyr::select(df_combined, -Gene)  # Eliminar identificadores
+
+# Seleccionar solo variables numéricas
+df_pca <- df_combined %>% dplyr::select(where(is.numeric))
+
+# Escalar los datos para PCA
+df_pca_scaled <- scale(df_pca)
+
+# Aplicar PCA
+pca_model <- prcomp(df_pca_scaled, center = TRUE, scale. = TRUE)
+
+# Crear un data frame con coordenadas de PCA
+pca_df <- as.data.frame(pca_model$x)
+pca_df$Source <- df_combined$Source
+
+# Ajustar tamaño de los puntos
+pca_df$size <- ifelse(pca_df$Source == "Real", 10, 5)  # Puntos reales más grandes
+
+# Crear gráfico 3D interactivo con plotly
+fig <- plot_ly(pca_df, 
+               x = ~PC1, 
+               y = ~PC2, 
+               z = ~PC3, 
+               color = ~Source, 
+               colors = c("red", "blue"),  # Rojo para reales, azul para SMOTE
+               marker = list(size = pca_df$size, line = list(width = 2, color = "black"))) %>%
+  layout(title = "PCA en 3D: Datos Reales vs. SMOTE",
+         scene = list(xaxis = list(title = "PC1"),
+                      yaxis = list(title = "PC2"),
+                      zaxis = list(title = "PC3")))
+
+# Mostrar gráfico interactivo
+fig
+
+```
+
+
+# 3 Modelos ML Supervisados
+
+## 3.1 Random Forest
+
+```{r}
+# Cargar la librería necesaria
+library(caret)
+library(randomForest)
+
+# Entrenar el modelo Random Forest en el conjunto de entrenamiento
+rf_model <- randomForest(Therapeutic_Target ~ ., data = df_train_smote, ntree = 100, mtry = 3, importance = TRUE)
+
+# Ver el modelo entrenado
+print(rf_model)
+
+# Evaluar el modelo en el conjunto de prueba
+rf_pred <- predict(rf_model, newdata = df_test_smote)
+
+# Crear la matriz de confusión
+conf_matrix <- confusionMatrix(rf_pred, df_test_smote$Therapeutic_Target)
+
+# Mostrar la matriz de confusión
+print(conf_matrix)
+```
+
+**Exportación del Modelo.**
+```{r}
+# Crear carpeta si no existe
+if (!dir.exists("Smote_Models")) {
+  dir.create("Smote_Models")
+}
+
+# Guardar el modelo en la carpeta creada
+saveRDS(rf_model, file = "Smote_Models/rf_smote_model.rds")
+
+```
+
+
+
+## 3.2 Árbol de Decisión
+```{r}
+# Cargar la librería necesaria
+library(rpart)
+library(rpart.plot)
+
+# Entrenar el modelo de Decision Tree en el conjunto de entrenamiento
+dt_model <- rpart(Therapeutic_Target ~ ., data = df_train_smote, method = "class", control = rpart.control(minsplit = 20))
+
+# Ver el modelo entrenado
+print(dt_model)
+
+# Graficar el árbol de decisión
+rpart.plot(dt_model, type = 3, extra = 101, fallen.leaves = TRUE)
+
+# Evaluar el modelo en el conjunto de prueba
+dt_pred <- predict(dt_model, newdata = df_test_smote, type = "class")
+
+# Evaluar el rendimiento utilizando una matriz de confusión
+confusion_matrix_dt <- table(dt_pred, df_test_smote$Therapeutic_Target)
+print(confusion_matrix_dt)
+
+# Calcular métricas como precisión, recall, F1-score
+library(caret)
+conf_matrix_dt <- confusionMatrix(confusion_matrix_dt)
+print(conf_matrix_dt)
+
+```
+
+
+**Usando el paquete `caret`.**
+```{r}
+library(caret)
+
+# Fijar semilla para reproducibilidad
+set.seed(123)
+
+# Convertir la variable objetivo a factor con nombres legibles
+# Class_0: clase negativa (no diana terapéutica)
+# Class_1: clase positiva (diana terapéutica)
+df_train_smote$Therapeutic_Target <- factor(df_train_smote$Therapeutic_Target, 
+                                            levels = c(0, 1), 
+                                            labels = c("Class_0", "Class_1"))
+
+# Control para el entrenamiento del modelo
+ctrl <- trainControl(
+  method = "cv",             # Validación cruzada (cross-validation)
+  number = 10,               # Número de pliegues: 10-fold
+  selectionFunction = "oneSE" # Selecciona el modelo más simple dentro de 1 error estándar del mejor
+)
+
+# Definición de la malla de hiperparámetros para probar con C5.0
+grid <- expand.grid(
+  .model = "tree",             # Modelo base: árbol de decisión
+  .trials = c(1, 5, 10, 15, 20, 25, 30, 35),  # Número de boosting iterations
+  .winnow = "FALSE"            # No aplicar reducción automática de variables (winnowing)
+)
+
+# Entrenamiento del modelo con caret::train
+(dt_model_2 <- train(
+  Therapeutic_Target ~ .,        # Fórmula: todas las variables explicativas predicen Therapeutic_Target
+  data = df_train_smote,         # Datos balanceados con SMOTE
+  method = "C5.0",               # Algoritmo: árbol de decisión C5.0
+  metric = "Kappa",              # Métrica de evaluación a optimizar
+  trControl = ctrl,             # Control definido arriba (validación cruzada, selección de modelo)
+  tuneGrid = grid               # Malla de hiperparámetros
+))
+
+```
+
+Vamos a exportar este modelo de árbol de decisión que ha obtenido mejores resultados que el primero.
+```{r}
+# Crear carpeta (si no existe)
+if (!dir.exists("Smote_Models")) {
+  dir.create("Smote_Models")
+}
+
+# Guardar el modelo entrenado
+saveRDS(dt_model_2, file = "Smote_Models/dt_smote_model.rds")
+```
+
+
+# 4. MODELO GNN 
+
+## 4.1 Importamos el archivo obtenido de Biogrid con las interacciones.
+```{python}
+import pandas as pd
+
+# Cargar el archivo
+df_interactions = pd.read_csv(r"C:\Users\juanm\Desktop\MASTER_BIOINFORMATICA\0_TFM_Bioinf\TFM_Resultados\BIOGRID-PROJECT-alzheimers_disease_project-LATEST\INTERACTIONS_BIOGRID_PROJECT_alzheimers_disease_project.txt", sep="\t", 
+low_memory=False) # Evitar problemas de memoria
+ 
+# Primeras filas
+df_interactions.head()
+df_interactions.shape
+```
+
+## 4.2 Filtrado de las columnas necesarias para generar el grafo
+NOTA: Se han filtrado las interacciones genéticas, seleccionando solo las físicas. 
+
+```{python}
+import pandas as pd
+
+# Filtrar solo interacciones físicas
+df_ppi = df_interactions[df_interactions["Experimental System Type"] == "physical"] # No interesan interacciones genéticas
+
+# Seleccionar solo columnas clave
+df_ppi = df_ppi[["Official Symbol Interactor A", "Official Symbol Interactor B"]]
+
+# Eliminar duplicados
+df_ppi = df_ppi.drop_duplicates()
+
+# Eliminar self-loops para simplificar el grafo
+df_ppi = df_ppi[df_ppi["Official Symbol Interactor A"] != df_ppi["Official Symbol Interactor B"]]
+
+
+# Mostrar las primeras filas
+df_ppi.head()
+
+```
+
+## 4.3 Preparación de los datos
+
+Asignar nombres a los genes usando `join` entre `caracteristics_ppi_ALZ` y `df_smote`. Si coinciden las características asignamos su nombre correspondiente. 
+
+### 4.3.1 Asignación de un nombre (`Synthetic_Gene_` + Índice) a los genes sintéticos y reales (nombre real del gen)
+```{r}
+library(dplyr)
+
+# Añadir ID temporal a df_smote para poder rastrear cada fila individualmente
+df_smote$ID_temp <- 1:nrow(df_smote)
+
+# Determinar las columnas comunes entre df_smote y el dataset original caracteristics_ppi_ALZ
+# Estas columnas se usarán para emparejar (join) las filas reales con las sintéticas
+join_cols <- intersect(names(df_smote), names(caracteristics_ppi_ALZ))
+
+# Excluir el ID temporal de las columnas a usar en el join
+join_cols <- setdiff(join_cols, c("ID_temp"))
+
+# Realizar un inner join entre df_smote y caracteristics_ppi_ALZ usando solo las columnas comunes
+# Esto permite encontrar las filas de df_smote que corresponden exactamente a genes reales
+matched <- inner_join(df_smote, caracteristics_ppi_ALZ, by = join_cols)
+
+# Si una fila de df_smote coincidiera con varias de caracteristics_ppi_ALZ, quedarse solo con una (la primera)
+matched_unique <- matched %>%
+  group_by(ID_temp) %>%
+  slice(1) %>%
+  ungroup()
+
+# Crear una nueva columna "Gene" en df_smote
+# Para las filas reales, asignar el nombre de gen correspondiente
+df_smote$Gene <- NA
+df_smote$Gene[matched_unique$ID_temp] <- matched_unique$Gene
+
+# Para las filas sintéticas (no emparejadas), asignar nombre `Synthetic_Gene_` + Índice
+missing_idxs <- which(is.na(df_smote$Gene))
+df_smote$Gene[missing_idxs] <- paste0("Synthetic_Gene_", seq_along(missing_idxs))
+
+# Eliminar la columna ID temporal que ya no se necesita
+df_smote$ID_temp <- NULL
+
+```
+
+**Comprobaciones de que se ha realizado correctamente**
+```{r}
+# Contar cuántos genes reales (no empiezan por "Synthetic_") y sintéticos hay
+gene_assignment_summary <- dplyr::mutate(
+  df_smote,
+  Gen_Type = ifelse(grepl("^Synthetic_Gene_", Gene), "Synthetic", "Real")
+) %>%
+  dplyr::count(Gen_Type)
+
+print(gene_assignment_summary)
+
+
+```
+
+Se han asignado correctamente los nombres.
+```{r}
+# Filtrar las filas del gen "x"
+df_mapt <- caracteristics_ppi_ALZ %>% filter(Gene == "CTSD") # Por ejemplo, buscamos el gen "CTSD"
+
+df_mapt_smote <- df_smote %>% filter(Gene == "CTSD")         # En ambos conjuntos de datos
+
+# Ver las primeras filas del dataframe filtrado
+head(df_mapt)
+head(df_mapt_smote)
+
+```
+
+### 4.3.2 Creación de las nuevas conexiones entre genes sintéticos y reales usando KNN
+
+```{r}
+library(FNN)
+library(dplyr)
+library(reticulate)
+
+# 1. Separar genes sintéticos y reales
+# Filtrar aquellos cuyo nombre empieza por "Synthetic_Gene_" (sintéticos)
+genes_sinteticos <- df_smote %>% 
+  filter(grepl("^Synthetic_Gene_", Gene))
+
+# Filtrar los genes reales (que no son sintéticos)
+genes_reales <- df_smote %>% 
+  filter(!grepl("^Synthetic_Gene_", Gene))
+
+# 2. Seleccionar las columnas numéricas (features), excluyendo identificador y clase
+features <- setdiff(names(df_smote), c("Gene", "Therapeutic_Target"))
+
+# Escalar las features de los genes reales (media = 0, sd = 1)
+X_real <- scale(genes_reales[, features])
+
+# Escalar las features de los genes sintéticos usando la media y sd de los reales 
+# Esto evita un sesgo artificial y se mantiene coherencia en el espacio de características
+X_sint <- scale(
+  genes_sinteticos[, features],
+  center = attr(X_real, "scaled:center"),
+  scale = attr(X_real, "scaled:scale")
+)
+
+# 3. Aplicar KNN: buscar los k vecinos reales más cercanos a cada sintético
+k <- 5
+knn_result <- get.knnx(X_real, X_sint, k = k)
+
+# 4. Crear las nuevas interacciones sintético-real
+# Repetir cada gen sintético k veces (uno por vecino)
+source_genes <- rep(genes_sinteticos$Gene, each = k)
+
+# Extraer los índices de los vecinos
+target_indices <- as.vector(knn_result$nn.index)
+
+# Obtener los nombres de los genes reales correspondientes a los índices
+target_genes <- genes_reales$Gene[target_indices]
+
+# Construir el dataframe de aristas sintéticas
+new_edges <- data.frame(
+  Source = source_genes,
+  Target = target_genes,
+  type = "synthetic",
+  stringsAsFactors = FALSE
+)
+
+# 5. Eliminar duplicados simétricos (Grafo No Dirigido: A-B y B-A son lo mismo)
+new_edges_clean <- new_edges %>%
+  filter(Source != Target) %>%                  # Evitar autoconexiones
+                                                # Evitar duplicados simétricos
+  mutate(Node1 = pmin(Source, Target),          # Para cada par de nodos (fila), se asigna el de menor orden a Node1
+         Node2 = pmax(Source, Target)) %>%      # y el de mayor orden a Node2, asegurando que A-B y B-A se representen igual
+  distinct(Node1, Node2, .keep_all = TRUE) %>%  # Eliminar duplicados entre pares simétricos (A-B == B-A)
+  dplyr::select(Source = Node1, Target = Node2, type)  # Renombra las columnas para dejarlas en el formato original
+
+# 6. Etiquetar las interacciones de la red original (tipo "original")
+# Renombrar las columnas para estandarizar los nombres
+df_original_edges <- py$df_ppi %>%
+  rename(Source = `Official Symbol Interactor A`,
+         Target = `Official Symbol Interactor B`) %>%
+  filter(Source != Target) %>%
+  mutate(type = "original")
+
+# 7. Combinar ambas redes: original + sintética
+df_ppi_combined <- bind_rows(df_original_edges, new_edges_clean)
+
+# 8. Mostrar resumen informativo del proceso
+cat("Interacciones originales:", nrow(df_original_edges), "\n")
+cat("Nuevas interacciones limpias:", nrow(new_edges_clean), "\n")
+cat("Total de interacciones en el grafo combinado:", nrow(df_ppi_combined), "\n")
+
+```
+
+**Revisar número de duplicados exactos (Source + Target)**
+```{r}
+duplicated_rows <- duplicated(df_ppi_combined[, c("Source", "Target")])
+sum(duplicated_rows)
+```
+
+**Los pasamos al entorno de Python**
+```{r}
+py$df_smote <- df_smote
+py$df_ppi_combined <- df_ppi_combined
+```
+
+
+### 4.3.3 Visualización del grafo combinado
+```{python}
+import networkx as nx
+import matplotlib.pyplot as plt
+
+# Crear el grafo desde el DataFrame
+G = nx.from_pandas_edgelist(df_ppi_combined, "Source", "Target")
+
+# Calcular el grado de cada nodo
+node_degree = dict(G.degree())
+
+# Seleccionar los 100 nodos más conectados
+top_nodes = sorted(node_degree, key=node_degree.get, reverse=True)[:100]
+
+# Crear un subgrafo con estos nodos
+G_sub = G.subgraph(top_nodes)
+
+# Usar un layout más expandido
+pos = nx.spring_layout(G_sub, k=2)  # k controla la dispersión de los nodos
+
+# Dibujar la red
+plt.figure(figsize=(16, 14))
+nx.draw(G_sub, pos, with_labels=False, node_size=40, edge_color="gray", alpha=0.6, width=0.5)
+
+# Identificar los nodos más conectados y etiquetarlos
+high_degree_nodes = [n for n, d in G_sub.degree() if d > 30]
+nx.draw_networkx_nodes(G_sub, pos, nodelist=high_degree_nodes, node_size=100, node_color="red")
+
+# Añadir etiquetas solo a los nodos clave
+labels = {n: n for n in high_degree_nodes}
+nx.draw_networkx_labels(G_sub, pos, labels, font_size=8, font_color="black")
+
+plt.title("Red PPI con los 300 nodos más conectados (mejor distribuida)")
+plt.show()
+
+```
+
+
+## 4.4 Creación del Modelo Graph Convolutional Network (GCN)
+
+### 4.4.1. Preparación de los Nodos (x) y Etiquetas (y)
+
+```{python}
+import pandas as pd
+import torch
+from torch_geometric.data import Data
+from sklearn.preprocessing import StandardScaler
+
+# - df_ppi_combined: con columnas "Source", "Target" y "type"
+# - df_smote: con las columnas de métricas, "Gene" y "Therapeutic_Target".
+#
+# Nota: df_smote incluye tanto genes reales como genes sintéticos (por SMOTE),
+# y los nombres de los genes sintéticos en la columna "Gene" con la estructura "Synthetic_Gene_<indice>".
+
+
+# ----------------------- 1. Filtro de aristas válidas ------------------------
+
+# 1. Definir el conjunto de genes válidos a partir de df_smote.
+valid_genes = set(df_smote["Gene"])
+
+# 2. Filtrar el dataframe de aristas para incluir solo aquellas aristas cuyos extremos estén en valid_genes.
+df_edges_filtered = df_ppi_combined[
+    df_ppi_combined["Source"].isin(valid_genes) & df_ppi_combined["Target"].isin(valid_genes)
+].copy()
+
+# 3. Crear un mapeo de genes a índices utilizando el orden de df_smote.
+gene2idx = {gene: idx for idx, gene in enumerate(df_smote["Gene"])}
+idx2gene = {idx: gene for gene, idx in gene2idx.items()}
+
+
+# ----------------------- 2. Preparar el objeto GNN ---------------------------
+
+# 4. Convertir los nombres de los genes en df_edges_filtered a sus índices numéricos.
+df_edges_filtered["Source"] = df_edges_filtered["Source"].map(gene2idx)
+df_edges_filtered["Target"] = df_edges_filtered["Target"].map(gene2idx)
+
+# Si la conversión produce valores NaN (lo que indicaría que algún gen no se encontró), lanzamos un error.
+if df_edges_filtered["Source"].isna().any() or df_edges_filtered["Target"].isna().any():
+    raise ValueError("Algunos genes de las aristas no se encontraron en df_smote.")
+
+# 5. Construir edge_index: una matriz de 2 x E donde cada columna representa una arista [nodo_fuente, nodo_destino].
+edge_index = torch.tensor(df_edges_filtered[['Source', 'Target']].values.T, dtype=torch.long)
+
+# 6. Preparar la matriz de características (x)
+# Se definen las columnas de características: todas las columnas excepto "Gene" y "Therapeutic_Target".
+feature_cols = [col for col in df_smote.columns if col not in ["Gene", "Therapeutic_Target"]]
+
+# Para asegurarnos de que todas las columnas sean numéricas, convertimos cada una de ellas.
+for col in feature_cols:
+    # 'errors="raise"' forzará una excepción si algún valor no se puede convertir a número.
+    df_smote[col] = pd.to_numeric(df_smote[col], errors='raise')
+
+# Escalar las características: se espera que StandardScaler trabaje con arrays numéricos.
+scaler = StandardScaler()
+x_array = scaler.fit_transform(df_smote[feature_cols])
+x = torch.tensor(x_array, dtype=torch.float)
+
+# 7. Crear el vector de etiquetas (y) a partir de la columna "Therapeutic_Target".
+# Nos aseguramos de que la conversión a número se haga correctamente.
+y = torch.tensor(pd.to_numeric(df_smote["Therapeutic_Target"], errors='raise').values, dtype=torch.long)
+
+# 8. Crear el objeto Data para la GNN, que agrupa x, edge_index y y.
+data = Data(x=x, edge_index=edge_index, y=y)
+
+# Mostrar la estructura del objeto Data.
+print(data)
+```
+
+### 4.4.2. Entrenamiento del modelo GCN
+
+**Entrenamiento y Compilación del Modelo.**
+```{python}
+import torch
+import torch.nn.functional as F
+from torch_geometric.nn import GCNConv
+import numpy as np
+
+# -----------------------------------------------------------------------------
+# 1. Preparación: Crear subconjuntos de entrenamiento, validación y test
+# -----------------------------------------------------------------------------
+
+# 'data' es el objeto torch_geometric.data.Data con:
+# - data.x: matriz de características de dimensión [N x F]
+# - data.edge_index: tensor de aristas de tamaño [2 x E]
+# - data.y: vector de etiquetas (long), de tamaño [N]
+
+# Se crea un split aleatorio de nodos.
+num_nodes = data.num_nodes     # Se obtiene el número total de nodos en el grafo
+
+# Se crea un array con los índices del 0 al número total de nodos - 1
+# Esto representa los identificadores de los nodos
+indices = np.arange(num_nodes)
+
+# Se reordenan aleatoriamente los índices para crear un particionado aleatorio
+# Esta mezcla aleatoria permitirá luego separar el conjunto en entrenamiento, validación y test sin sesgo
+np.random.shuffle(indices)
+
+# 70% entrenamiento, 15% validación y 15% prueba
+# Número de nodos que formarán parte del conjunto de entrenamiento (70%)
+train_size = int(0.7 * num_nodes)
+
+# Número de nodos para el conjunto de validación (15%)
+val_size = int(0.15 * num_nodes)
+
+# Asignación de los primeros nodos aleatorios al entrenamiento (70%)
+train_indices = indices[:train_size]
+
+# Asignación de los siguientes nodos (15%) al conjunto de validación
+val_indices = indices[train_size:train_size + val_size]
+
+# El resto de nodos (15% restantes) se usan como conjunto de prueba
+test_indices = indices[train_size + val_size:]
+
+
+# Creamos las máscaras booleanas del mismo tamaño que el número de nodos
+# Creamos una máscara para cada subconjunto (entrenamiento, validación, prueba)
+data.train_mask = torch.zeros(num_nodes, dtype=torch.bool) # Todos los valores se inicializan como False
+data.val_mask = torch.zeros(num_nodes, dtype=torch.bool)
+data.test_mask = torch.zeros(num_nodes, dtype=torch.bool)
+
+# Asignamos True en las posiciones correspondientes a los índices seleccionados
+data.train_mask[train_indices] = True    # Nodos de Entrenamiento
+data.val_mask[val_indices] = True        # Nodos de Validación
+data.test_mask[test_indices] = True      # Nodos de test
+
+# -----------------------------------------------------------------------------
+# 2. Definición del modelo GCN
+# -----------------------------------------------------------------------------
+
+# Definimos una clase GCN que hereda de torch.nn.Module
+class GCN(torch.nn.Module):
+    
+    # Constructor de la clase: define la arquitectura del modelo
+    def __init__(self, in_channels, hidden_channels, out_channels, dropout=0.5):
+        super(GCN, self).__init__()                  # Llama al constructor de la clase base (torch.nn.Module)
+        
+        # Primera capa GCN: reduce de in_channels a hidden_channels
+        self.conv1 = GCNConv(in_channels, hidden_channels)
+        
+        # Segunda capa GCN: de hidden_channels a out_channels (número de clases)
+        self.conv2 = GCNConv(hidden_channels, out_channels)
+        
+        # Parámetro de dropout
+        self.dropout = dropout
+
+    # Método forward: define el paso hacia adelante de los datos por la red
+    def forward(self, x, edge_index):
+        # Aplica la primera convolución sobre el grafo
+        x = self.conv1(x, edge_index)
+        
+        # Aplica función de activación ReLU
+        x = F.relu(x)
+        
+        # Aplica dropout si estamos en entrenamiento
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        
+        # Aplica la segunda convolución y retorna los logits de clasificación
+        x = self.conv2(x, edge_index)
+        return x
+
+
+# Función auxiliar para hacer predicciones binarizadas a partir del modelo
+def predict(self, x, edge_index, threshold=0.5):       # o 0.6
+        """
+        Realiza la inferencia, aplicando softmax y un umbral para obtener las predicciones finales.
+        :param x: Matriz de características.
+        :param edge_index: Tensor de aristas.
+        :param threshold: Umbral de decisión para la probabilidad de la clase 1.
+        :return: Predicciones finales (tensor de etiquetas 0 o 1).
+        """
+        
+        # Cambia el modelo a modo evaluación (desactiva dropout, etc.)
+        self.eval()
+        
+        # Desactiva cálculo de gradientes para eficiencia
+        with torch.no_grad():          
+            # Paso hacia adelante para obtener logits
+            logits = self.forward(x, edge_index)
+            # Aplicar softmax para convertir logits en probabilidades
+            probabilities = torch.softmax(logits, dim=1)
+            # Extraer las probabilidades correspondientes a la clase 1
+            y_probs = probabilities[:, 1]
+            # Aplicar el umbral para definir las predicciones
+            # Devuelve 1 si la probabilidad >= threshold, si no, 0
+            predictions = (y_probs >= threshold).long()
+        return predictions
+
+# -----------------------------------------------------------------------------
+# 3. Configuración del entrenamiento
+# -----------------------------------------------------------------------------
+
+# Seleccionar el dispositivo de cómputo:
+# - Si hay una GPU disponible, se usará (más rápido).
+# - Si no, se utilizará la CPU.
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Extracción del nº de características (features) de entrada por nodo desde el grafo 'data'
+in_channels = data.num_node_features   # Dimensión de las características: nº de features de entrada por nodo
+
+# Definir el número de neuronas en la capa oculta
+hidden_channels = 16          # A más neuronas = mayor capacidad de representación
+
+# Número de clases de salida (en este caso, 2 para clasificación binaria)
+out_channels = 2              
+
+# Crear el modelo GCN con los parámetros definidos
+# Se envía el modelo al dispositivo (CPU o GPU)
+model = GCN(in_channels, hidden_channels, out_channels, dropout=0.5).to(device)
+
+# También se transfiere el objeto 'data' al mismo dispositivo (debe estar en la misma memoria que el modelo)
+data = data.to(device)
+
+# Definición del optimizador (Adam con tasa de aprendizaje de 0.01 y regularización L2 de 5e-4)
+# El optimizador se encarga de actualizar los pesos durante el entrenamiento
+# Paso equivalente a la compilación que en torch es implícita
+optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
+
+# -----------------------------------------------------------------------------
+# 4. Funciones de entrenamiento y evaluación
+# -----------------------------------------------------------------------------
+
+# Función de entrenamiento del modelo _sin_ pesos de clase
+def train():
+    model.train()                     # Establece el modo 'entrenamiento' (activa dropout, etc.)
+    optimizer.zero_grad()             # Resetea los gradientes acumulados de los pasos anteriores
+    
+    # Propagación hacia adelante (forward pass)
+    out = model(data.x, data.edge_index)       # Predicciones del modelo
+    
+    # Calcular la función de pérdida (cross-entropy) **solo sobre los nodos de entrenamiento**
+    loss = F.cross_entropy(
+        out[data.train_mask],        # Predicciones del conjunto de entrenamiento
+        data.y[data.train_mask])     # Etiquetas verdaderas del conjunto de entrenamiento
+        
+    loss.backward()                  # Retropropagación del error
+    optimizer.step()                 # Actualización de los pesos con el optimizador
+    return loss.item()               # Devolver el valor numérico de la pérdida para monitorizar el entrenamiento
+
+# Función de evaluación del modelo
+def test():
+    model.eval()                          # Modo evaluación (desactiva dropout, batchnorm, etc.)
+    out = model(data.x, data.edge_index)  # Forward completo sobre todo el grafo
+    
+    # Obtener predicciones: toma el índice del logit con mayor valor (clase más probable)
+    pred = out.argmax(dim=1)
+    accuracies = {}                   # Diccionario para guardar la precisión en cada split
+    
+    # Calcular precisión en los 3 subconjuntos: Train, Validation, Test
+    for key, mask in zip(["Train", "Validation", "Test"], 
+                         [data.train_mask, data.val_mask, data.test_mask]):
+        # Comparar las predicciones con las etiquetas reales en el subconjunto correspondiente
+        correct = (pred[mask] == data.y[mask]).sum().item()
+        # Calcular la precisión: aciertos / total
+        acc = correct / mask.sum().item() if mask.sum().item() > 0 else 0
+        # Guardar en el diccionario
+        accuracies[key] = acc
+    return accuracies       # Devuelve un diccionario con la precisión para cada conjunto
+
+# -----------------------------------------------------------------------------
+# 5. Ciclo de entrenamiento
+# -----------------------------------------------------------------------------
+
+# Número total de épocas para entrenar el modelo
+num_epochs = 200
+
+# Bucle principal de entrenamiento
+for epoch in range(1, num_epochs + 1):
+  
+    # Ejecutar una pasada de entrenamiento y obtener la pérdida
+    loss = train()
+    # Evaluar el modelo en los tres conjuntos: entrenamiento, validación y prueba
+    accs = test()
+    # Mostrar resultados cada 10 épocas
+    if epoch % 10 == 0:
+        print(f'Epoch: {epoch:03d}, Loss: {loss:.4f}, '
+              f'Train: {accs["Train"]:.4f}, Val: {accs["Validation"]:.4f}, Test: {accs["Test"]:.4f}')
+
+```
+
+
+### 4.4.3. Optimización del Modelo 
+
+#### A) Búsqueda (grid search) de pesos para la función de pérdida
+
+Este bloque implementa un proceso de búsqueda de hiperparámetros (grid search) para encontrar los pesos óptimos a utilizar en la función de pérdida ponderada (cross_entropy) al entrenar la red neuronal (GCN). El objetivo es aumentar la sensibilidad del modelo hacia la clase minoritaria (clase 1).
+```{python include=FALSE}
+import numpy as np
+import torch
+import torch.nn.functional as F
+from sklearn.metrics import f1_score
+
+# Tenemos definido:
+# - data: objeto torch_geometric.data.Data con data.x, data.edge_index, data.y, data.train_mask, data.val_mask, data.test_mask.
+# - La clase GCN definida anteriormente y la variable 'device' con el dispositivo correspondiente.
+# - Los hiperparámetros: in_channels, hidden_channels, out_channels, etc.
+
+# 1. Calcular pesos iniciales basados en la frecuencia de la clase en el conjunto de entrenamiento.
+
+# Extraer las etiquetas del conjunto de entrenamiento y convertirlas a un array de NumPy
+train_labels = data.y[data.train_mask].cpu().numpy() 
+
+# Utilizamos np.bincount para contar cuántas instancias hay de cada clase
+class_counts = np.bincount(train_labels)
+print("Recuento de clases en train:", class_counts)
+
+# Calcular los pesos inversos a la frecuencia de cada clase
+initial_weights = 1.0 / class_counts.astype(np.float32)
+
+# Normalizar los pesos para que sumen 1 
+initial_weights = initial_weights / initial_weights.sum()
+print("Pesos iniciales:", initial_weights)
+
+# 2. Definir combinaciones de pesos a probar
+
+# Lista de multiplicadores a aplicar a cada peso para hacer una búsqueda de combinaciones
+multiplicadores = [0.5, 1.0, 2.0]
+
+# Inicializar la mejor métrica (f1-score) y los pesos asociados
+best_f1 = 0.0
+best_weights = None
+
+# Definir cuántas épocas se entrenan en cada iteración de validación
+num_epochs_validacion = 50
+
+# 3. Búsqueda exhaustiva (Grid Search) sobre las combinaciones posibles
+# Probar todas las combinaciones posibles de multiplicadores (clase 0 y clase 1)
+for m0 in multiplicadores:
+    for m1 in multiplicadores:
+        # Crear pesos candidatos a partir de los iniciales y multiplicadores
+        candidate_weights = np.array([initial_weights[0] * m0, initial_weights[1] * m1], dtype=np.float32)
+        candidate_weights_tensor = torch.tensor(candidate_weights, dtype=torch.float, device=device)
+        
+        print(f"\nProbando multiplicadores => Clase 0: {m0}, Clase 1: {m1}")
+        print("Pesos candidatos:", candidate_weights)
+        
+        # Reiniciar el modelo y optimizador para empezar de cero con cada combinación
+        model = GCN(in_channels, hidden_channels, out_channels, dropout=0.5).to(device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
+        
+        # Entrenar el modelo con los pesos actuales durante num_epochs_validacion
+        for epoch in range(num_epochs_validacion):
+            model.train()
+            optimizer.zero_grad()
+            out = model(data.x, data.edge_index)
+            loss = F.cross_entropy(out[data.train_mask], data.y[data.train_mask], weight=candidate_weights_tensor)
+            loss.backward()
+            optimizer.step()
+        
+        # 5. Evaluar en el conjunto de validación
+        # Hacer predicciones en modo evaluación
+        model.eval()
+        out = model(data.x, data.edge_index)
+        pred = out.argmax(dim=1)                # Tomar la clase con mayor probabilidad
+        
+        # Obtener predicciones y etiquetas verdaderas en el conjunto de validación
+        pred_val = pred[data.val_mask].cpu().numpy()
+        true_val = data.y[data.val_mask].cpu().numpy()
+        
+        # Calcular el f1-score para la clase 1 (minoritaria) 
+        current_f1 = f1_score(true_val, pred_val, pos_label=1)
+        print(f"Multiplicadores ({m0}, {m1}) -> F1 (clase 1): {current_f1:.4f}")
+        
+        # 6. Actualizar y guardar el mejor resultado si mejora el f1-score 
+        if current_f1 > best_f1:
+            best_f1 = current_f1
+            best_weights = candidate_weights_tensor
+
+print("\nMejores pesos encontrados:", best_weights, "con f1-score:", best_f1)
+
+```
+
+
+#### B) Refinar el umbral de decisión: 
+En lugar de asignar la clase 1 cuando la probabilidad es mayor o igual a 0.5 (que es el umbral por defecto cuando se toma el argmax de los logits), buscamos un umbral alternativo que mejore la métrica f1-score para la clase de interés.
+```{python}
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.metrics import f1_score, precision_score, recall_score
+
+# 1. Obtener las probabilidades de predicción para cada nodo
+model.eval()        # Poner el modelo en modo evaluación
+# Desactivamos el cálculo del gradiente porque no es necesario en evaluación (ahorra memoria y tiempo)
+with torch.no_grad():
+    out = model(data.x, data.edge_index) # Realiza inferencia (logits sin normalizar)
+    probs = torch.softmax(out, dim=1)   # Aplica softmax a las salidas para convertir logits a probabilidades
+
+
+# 2. Extraer probabilidades y etiquetas verdaderas
+y_probs = probs[:, 1].cpu().numpy() # Columna de probabilidades de la clase 1 (diana terapéutica)
+
+y_true = data.y.cpu().numpy()       # Convertimos las etiquetas verdaderas a NumPy
+
+# 3. Filtrar por conjunto de validación
+mask = data.val_mask.cpu().numpy() # Extraemos la máscara del conjunto de validación
+
+# Filtramos las probabilidades y etiquetas verdaderas para quedarnos solo con los ejemplos de validación
+y_true_val = y_true[mask]
+y_probs_val = y_probs[mask]
+
+# 4. Evaluar diferentes umbrales de decisión
+# Generamos una secuencia de umbrales entre 0 y 1 con pasos de 0.01
+thresholds = np.arange(0, 1.01, 0.01)
+
+# Inicializamos listas para guardar las métricas a cada umbral
+f1_scores = []
+precisions = []
+recalls = []
+
+# Evaluamos las métricas para cada umbral
+for t in thresholds:
+    # Generar predicciones binarias: clase 1 si prob >= t, clase 0 si no
+    y_pred = (y_probs_val >= t).astype(int)
+    
+    # Calcular las métricas con este umbral
+    f1 = f1_score(y_true_val, y_pred, zero_division=0)
+    precision = precision_score(y_true_val, y_pred, zero_division=0)
+    recall = recall_score(y_true_val, y_pred, zero_division=0)
+    
+    # Guardar los resultados
+    f1_scores.append(f1)
+    precisions.append(precision)
+    recalls.append(recall)
+
+# 5. Determinar el umbral óptimo
+
+best_index = np.argmax(f1_scores)           # Encontrar el índice del umbral con mayor F1-score
+best_threshold = thresholds[best_index]     # Extraer el mejor umbral
+
+# Resultados para el mejor umbral
+print(f"Mejor umbral: {best_threshold:.2f}")
+print(f"F1-score en validación: {f1_scores[best_index]:.4f}")
+print(f"Precisión: {precisions[best_index]:.4f}, Recall: {recalls[best_index]:.4f}")
+
+# 6. Graficar cómo varían las métricas según el umbral
+# Crear gráfico de líneas con F1, Precisión y Recall en función del umbral
+plt.figure(figsize=(10, 5))
+plt.plot(thresholds, f1_scores, label='F1-score')
+plt.plot(thresholds, precisions, label='Precisión')
+plt.plot(thresholds, recalls, label='Recall')
+plt.xlabel("Umbral")
+plt.ylabel("Métrica")
+plt.title("Curvas de F1, Precisión y Recall en función del umbral")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+```
+
+### 4.4.4 Modelo GCN Final
+Volver a ejecutar el modelo ajustando pesos y umbral: 
+```{python}
+import torch
+import torch.nn.functional as F
+from torch_geometric.nn import GCNConv
+import numpy as np
+
+# -----------------------------------------------------------------------------
+# 1. Preparación: Crear splits de entrenamiento, validación y test
+# -----------------------------------------------------------------------------
+
+# 'data' es el objeto torch_geometric.data.Data ya creado, con:
+# - data.x: matriz de características de dimensión [N x F]
+# - data.edge_index: tensor de aristas de tamaño [2 x E]
+# - data.y: vector de etiquetas (long), de tamaño [N]
+
+# División aleatoria de nodos.
+num_nodes = data.num_nodes      # Número total de nodos en el grafo
+
+# Array con los índices del 0 al número total de nodos - 1
+# Esto representa los identificadores de los nodos
+indices = np.arange(num_nodes)
+
+# Reordenamiento aleatorio de los índices (permite luego separar los subconjuntos sin sesgo)
+np.random.shuffle(indices)
+
+# 70% entrenamiento, 15% validación y 15% prueba
+train_size = int(0.7 * num_nodes)
+val_size = int(0.15 * num_nodes)
+
+train_indices = indices[:train_size]  # Primeros nodos aleatorios al entrenamiento (70%)
+val_indices = indices[train_size:train_size + val_size] # Subconjunto de validación
+test_indices = indices[train_size + val_size:]          # Subconjunto de prueba
+
+# Creamos máscaras booleanas del mismo tamaño que el número de nodos
+data.train_mask = torch.zeros(num_nodes, dtype=torch.bool)
+data.val_mask = torch.zeros(num_nodes, dtype=torch.bool)
+data.test_mask = torch.zeros(num_nodes, dtype=torch.bool)
+
+# Asignamos True en las posiciones correspondientes a los índices seleccionados
+data.train_mask[train_indices] = True
+data.val_mask[val_indices] = True
+data.test_mask[test_indices] = True
+
+# -----------------------------------------------------------------------------
+# 2. Definición del modelo GCN
+# -----------------------------------------------------------------------------
+
+# Definimos una clase GCN que hereda de torch.nn.Module
+class GCN(torch.nn.Module):
+      
+    # Constructor de la clase: define la arquitectura del modelo
+    def __init__(self, in_channels, hidden_channels, out_channels, dropout=0.5):
+        super(GCN, self).__init__()   # Llama al constructor de la clase base (torch.nn.Module)
+        
+        # Primera capa GCN: reduce de in_channels a hidden_channels
+        self.conv1 = GCNConv(in_channels, hidden_channels)
+        # Segunda capa GCN: de hidden_channels a out_channels (número de clases)
+        self.conv2 = GCNConv(hidden_channels, out_channels)
+        # Parámetro de dropout
+        self.dropout = dropout
+
+    # Método forward: define el paso hacia adelante de los datos por la red
+    def forward(self, x, edge_index):
+        # Primera convolución sobre el grafo
+        x = self.conv1(x, edge_index)
+        x = F.relu(x)                 # Función de activación ReLU
+        x = F.dropout(x, p=self.dropout, training=self.training) # Aplica dropout si estamos en entrenamiento
+        
+        # Segunda convolución para generar logits de clasificación
+        x = self.conv2(x, edge_index)
+        return x
+
+# Función auxiliar para hacer predicciones binarizadas a partir del modelo
+def predict(self, x, edge_index, threshold=best_threshold): # Se incluye el mejor umbral calculado (best_threshold)
+        """
+        Realiza la inferencia, aplicando softmax y un umbral para obtener las predicciones finales.
+        :param x: Matriz de características.
+        :param edge_index: Tensor de aristas.
+        :param threshold: Umbral de decisión para la probabilidad de la clase 1.
+        :return: Predicciones finales (tensor de etiquetas 0 o 1).
+        """
+        # Cambia el modelo a modo evaluación (desactiva dropout, etc.)
+        self.eval()
+        with torch.no_grad():  # Desactiva cálculo de gradientes para eficiencia
+            # Paso hacia adelante para obtener logits
+            logits = self.forward(x, edge_index)
+            # Aplicar softmax para convertir logits en probabilidades
+            probabilities = torch.softmax(logits, dim=1)
+            # Extraer las probabilidades de la clase 1
+            y_probs = probabilities[:, 1]
+            # Aplicar el umbral para definir las predicciones
+            # Devuelve 1 si la probabilidad >= threshold, si no, 0
+            predictions = (y_probs >= threshold).long()
+        return predictions
+
+# -----------------------------------------------------------------------------
+# 3. Configuración del entrenamiento
+# -----------------------------------------------------------------------------
+
+# Seleccionar el dispositivo de cómputo:
+# - Si hay una GPU disponible, se usará (más rápido).
+# - Si no, se utilizará la CPU.
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Nº de características (features) de entrada por nodo desde el grafo 'data'
+in_channels = data.num_node_features  # Nº de features de entrada por nodo
+hidden_channels = 16                  # Definir el número de neuronas en la capa oculta
+out_channels = 2                      # Nº de clases de salida (2 para clasificación binaria)
+
+# Crear el modelo GCN (Graph Convolutional Network) con los parámetros definidos
+# Se envía el modelo al dispositivo (CPU o GPU)
+model = GCN(in_channels, hidden_channels, out_channels, dropout=0.5).to(device)
+
+# También se transfiere el objeto 'data' al mismo dispositivo (debe estar en la misma memoria que el modelo)
+data = data.to(device)
+
+# Definición del optimizador (Adam con tasa de aprendizaje de 0.01 y regularización L2 de 5e-4)
+# El optimizador es el encargado de actualizar los pesos durante el entrenamiento
+# Equivalente a la compilación que en `Pytorch` es implícita
+optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
+
+# -----------------------------------------------------------------------------
+# 4. Funciones de entrenamiento y evaluación
+# -----------------------------------------------------------------------------
+
+# Función de entrenamiento del modelo
+def train():
+    model.train()              # Establece el modo 'entrenamiento' (activa dropout, etc.)
+    optimizer.zero_grad()      # Resetea los gradientes acumulados de los pasos anteriores
+    
+    # Propagación hacia adelante (forward pass) 
+    out = model(data.x, data.edge_index) # Predicciones del modelo
+    
+    # Calcular la función de pérdida (cross-entropy) **solo sobre los nodos de entrenamiento**
+    
+    loss = F.cross_entropy(
+      out[data.train_mask],     # Predicciones del conjunto de entrenamiento
+      data.y[data.train_mask],  # Etiquetas verdaderas del conjunto de entrenamiento
+      weight=best_weights)      # Ahora pasamos 'weight = best_weights' a la función de pérdida
+    
+    loss.backward()        # Retropropagación del error
+    optimizer.step()       # Actualización de los pesos con el optimizador
+    return loss.item()     # Devolver el valor numérico de la pérdida para monitorizar el entrenamiento
+
+# Función de evaluación del modelo
+def test():
+    model.eval()
+    out = model(data.x, data.edge_index)   # Forward completo sobre todo el grafo
+    # Obtener predicciones: toma el índice del logit con mayor valor (clase más probable)
+    pred = out.argmax(dim=1)
+    accuracies = {}           # Diccionario para guardar la precisión en cada split
+    
+    # Calcular precisión en los 3 subconjuntos: Train, Validation, Test
+    for key, mask in zip(["Train", "Validation", "Test"], 
+                         [data.train_mask, data.val_mask, data.test_mask]):
+        
+        # Comparar las predicciones con las etiquetas reales en el subconjunto correspondiente
+        correct = (pred[mask] == data.y[mask]).sum().item()
+        
+        # Calcular la precisión: aciertos / total
+        acc = correct / mask.sum().item() if mask.sum().item() > 0 else 0
+        
+        # Guardar en el diccionario
+        accuracies[key] = acc
+    return accuracies          # Devuelve un diccionario con la precisión para cada conjunto
+
+# -----------------------------------------------------------------------------
+# 5. Ciclo de entrenamiento
+# -----------------------------------------------------------------------------
+ 
+num_epochs = 200   # Número total de épocas para entrenar el modelo
+
+# Bucle principal de entrenamiento
+for epoch in range(1, num_epochs + 1):
+    loss = train()      # Ejecutar una pasada de entrenamiento y obtener la pérdida
+    accs = test()       # Evaluar el modelo en los tres conjuntos: entrenamiento, validación y prueba
+
+    # Mostrar resultados cada 10 épocas
+    if epoch % 10 == 0:
+        print(f'Epoch: {epoch:03d}, Loss: {loss:.4f}, '
+              f'Train: {accs["Train"]:.4f}, Val: {accs["Validation"]:.4f}, Test: {accs["Test"]:.4f}')
+
+```
+
+
+## 4.5 Métricas de Evaluación del Modelo GCN
+ 
+Rendimiento del modelo sobre el conjunto de test (`data.test_mask`).
+```{python}
+import numpy as np
+from sklearn.metrics import confusion_matrix, classification_report
+
+# Poner el modelo en modo evaluación
+model.eval()
+# Realizamos la inferencia en todo el grafo
+out = model(data.x, data.edge_index)
+# Convertir los logits a predicciones (la clase con el valor máximo)
+pred = out.argmax(dim=1).cpu().numpy()
+
+# Extraer las etiquetas reales
+true = data.y.cpu().numpy()
+
+# Si solo queremos evaluar en el conjunto de test, usamos la test_mask
+test_mask = data.test_mask.cpu().numpy()
+# Aplicamos la máscara de test
+pred_test = pred[test_mask]
+true_test = true[test_mask]
+
+# Calcular la matriz de confusión
+conf_mat = confusion_matrix(true_test, pred_test)
+print("Matriz de Confusión:")
+print(conf_mat)
+
+# Obtener un reporte con precisión, recall, f1-score y más métricas
+report = classification_report(true_test, pred_test)
+print("\nReporte de Clasificación:")
+print(report)
+
+```
+
+Nos interesa un `recall` alto para detectar la mayor cantidad posible de dianas terapéuticas: Un recall alto (0.86) aunque sea a costa de tener una cantidad relativamente alta de falsos positivos (precisión de 0.44).
+
+### 4.5.1 Curvas ROC y Precision-Recall
+```{python}
+import torch
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve, auc, precision_recall_curve, average_precision_score
+
+# 1. Evaluar el modelo y obtener las probabilidades en el conjunto de test
+model.eval()
+with torch.no_grad():
+    # Realizamos la inferencia en todo el grafo
+    out = model(data.x, data.edge_index)
+    # Convertimos los logits a probabilidades (softmax) para cada clase
+    probs = torch.softmax(out, dim=1)
+
+# Extraer las probabilidades de la clase 1 (diana terapéutica)
+y_scores = probs[:, 1].cpu().numpy()
+y_true = data.y.cpu().numpy()
+
+# Aplicar la máscara de test para obtener solo los valores correspondientes al conjunto de test
+test_mask = data.test_mask.cpu().numpy()
+y_true_test = y_true[test_mask]
+y_scores_test = y_scores[test_mask]
+
+# 2. Calcular la Curva ROC y el AUC
+fpr, tpr, thresholds = roc_curve(y_true_test, y_scores_test)
+roc_auc = auc(fpr, tpr)
+
+plt.figure()
+plt.plot(fpr, tpr, label=f'ROC Curve (AUC = {roc_auc:.2f})')
+plt.plot([0, 1], [0, 1], 'k--', label='Baseline')
+plt.xlabel('Tasa de Falsos Positivos')
+plt.ylabel('Tasa de Verdaderos Positivos (Recall)')
+plt.title('Curva ROC')
+plt.legend(loc='lower right')
+plt.show()
+
+# 3. Calcular la Curva Precision-Recall y el Average Precision Score
+precision, recall, thresholds_pr = precision_recall_curve(y_true_test, y_scores_test)
+avg_precision = average_precision_score(y_true_test, y_scores_test)
+
+plt.figure()
+plt.plot(recall, precision, label=f'Precision-Recall Curve (AP = {avg_precision:.2f})')
+plt.xlabel('Recall')
+plt.ylabel('Precision')
+plt.title('Curva Precision-Recall')
+plt.legend(loc='lower left')
+plt.show()
+
+```
+
+
+## 4.6 Exportar el Modelo GCN Entrenado
+```{python eval=FALSE, include=FALSE}
+import os
+import torch
+
+# Crear carpeta si no existe
+os.makedirs("Smote_Models", exist_ok=True)
+
+# Guardar el modelo en la carpeta
+torch.save(model, "Smote_Models/gcn_SMOTE_model.pt")
+```
+

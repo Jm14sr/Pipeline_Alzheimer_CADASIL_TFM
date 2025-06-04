@@ -1,0 +1,1624 @@
+---
+title: "TFM_4_ML_RD"
+author: "Juan Manuel Sancho Romero"
+date: "2025-04-29"
+output:
+  html_document:
+    df_print: paged
+    toc: yes
+    toc_float: true
+    code_folding: show
+    theme: united
+    higlight: tango
+  pdf_document:
+    keep_tex: yes
+    toc: yes
+header-includes: \usepackage[spanish]{babel}
+params:
+  file1: caracteristics_ppi_ALZHEIMER.csv
+  folder.data: C:/Users/juanm/Desktop/MASTER_BIOINFORMATICA/0_TFM_Bioinf/TFM_Resultados
+  p.train: 0.75 # 75% de los datos para definir el conjunto de entrenamiento
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages, message=FALSE, echo=FALSE, warning=FALSE}
+# Paquetes de CRAN
+cran_libraries <- c(
+  "caret", "class", "C50", "dplyr", "e1071", "gmodels", 
+  "ggfortify", "ggplot2", "kableExtra", "kernlab", "knitr",
+  "nortest", "randomForest", "reticulate", "ROCR", "RCurl", "pheatmap",
+  "igraph"  
+)
+
+# Verificar e instalar paquetes de CRAN que faltan
+missing_cran <- setdiff(cran_libraries, installed.packages()[, "Package"])
+if (length(missing_cran) > 0) install.packages(missing_cran)
+
+# Paquetes de Bioconductor
+bioc_libraries <- c("biomaRt", "GEOquery", "Biobase", "DESeq2", "EnhancedVolcano", "STRINGdb")
+
+# Instalar BiocManager si no está disponible
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+
+# Verificar e instalar paquetes de Bioconductor que faltan
+missing_bioc <- setdiff(bioc_libraries, installed.packages()[, "Package"])
+if (length(missing_bioc) > 0) BiocManager::install(missing_bioc)
+
+# Cargar todos los paquetes
+invisible(lapply(c(cran_libraries, bioc_libraries), library, character.only = TRUE))
+
+
+
+```
+
+ENFERMEDAD RARA: CADASIL
+
+Muestra GO : GSE124500
+Pertenece a: 
+Ling, C., Liu, Z., Song, M., Zhang, W., Wang, S., Liu, X., ... & Liu, G. H. (2019). Modeling CADASIL vascular pathologies with patient-derived induced pluripotent stem cells. Protein & cell, 10(4), 249-271. https://doi.org/10.1093/procel/pwad059 
+
+DATOS: <https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE124500> 
+
+```{r}
+# Identificador del dataset
+gse_id <- "GSE124500"
+
+# Descarga de los datos de la plataforma GEO
+gse_list <- getGEO(gse_id, GSEMatrix = TRUE)
+
+# Extrae el objeto ExpressionSet
+gse <- gse_list[[1]]
+
+# Mira un resumen de los datos descargados
+summary(gse)
+
+# Accede a la matriz de expresión
+expression_data <- exprs(gse)
+
+# Accede a los datos fenotípicos (metadata de las muestras)
+pheno_data <- pData(gse)
+
+# Accede a la información de las variables (genes)
+feature_data <- fData(gse)
+
+```
+
+# 1. Descargar y extraer datos
+
+```{r download-extract, eval=FALSE, include=FALSE}
+# Borra archivo dañado y la carpeta si ya fue descargada
+unlink("GSE124500_RAW.tar")
+unlink("GSE124500_RAW", recursive = TRUE)
+
+# Fuerza nueva descarga manual del archivo suplementario RAW desde GEO
+url <- "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE124nnn/GSE124500/suppl/GSE124500_RAW.tar"
+download.file(url, destfile = "GSE124500_RAW.tar", mode = "wb")  # <- usa modo binario
+
+# Extraer de nuevo
+untar("GSE124500_RAW.tar", exdir = "GSE124500_RAW")
+
+# Verifica
+list.files("GSE124500_RAW")
+
+```
+
+# 2. Cargar los datos de expresión y combinarlos
+
+```{r load-merge}
+library(readr)
+library(dplyr)
+
+# Archivos de expresión
+files <- list.files("GSE124500_RAW", full.names = TRUE, pattern = ".gz$")
+
+# Leer cada archivo en una lista
+read_counts <- function(file) {
+  df <- read_tsv(file, col_names = TRUE, show_col_types = FALSE)
+  colnames(df)[2] <- gsub("\\.count\\.(txt|tsv)\\.gz$", "", basename(file))  # nombre de muestra
+  return(df)
+}
+
+# Aplicar lectura a todos
+expr_list <- lapply(files, read_counts)
+
+# Hacer full_join secuencialmente por 'GeneID'
+expression_matrix <- Reduce(function(x, y) full_join(x, y, by = "GeneID"), expr_list)
+
+# Es necesario convertir a dataframe
+expression_matrix <- as.data.frame(expression_matrix)  
+
+# Poner 'GeneID' como rownames
+rownames(expression_matrix) <- expression_matrix$GeneID
+expression_matrix$GeneID <- NULL
+
+
+# Reemplazar NA por 0
+expression_matrix[is.na(expression_matrix)] <- 0
+
+# Verificar
+dim(expression_matrix)
+head(expression_matrix[, 1:3])
+head(rownames(expression_matrix))
+
+
+```
+
+## Crear tabla de diseño (colData) con las características de las muestras
+(si devuelve error de conexión, hay que eliminar los archivos ya descargados usando: 
+file.remove("GSE124500_series_matrix.txt.gz")
+file.remove("GSE124500_series_matrix.txt.gz.1"))
+```{r}
+# Descargar pheno_data
+library(GEOquery)
+
+gse_list <- getGEO("GSE124500", GSEMatrix = TRUE)
+gse <- gse_list[[1]]
+pheno_data <- pData(gse)
+
+# Comprobar si las columnas de expression_matrix coinciden con las filas de pheno_data (IMPORTANTE para DESeq2)
+all(colnames(expression_matrix) %in% rownames(pheno_data))
+```
+
+```{r}
+# Modificamos los nombres de las columnas de expression_matrix para que coincidan con PhenoData
+colnames(expression_matrix) <- sub("_.*", "", colnames(expression_matrix))
+
+# Volvemos a comprobar si coinciden
+all(colnames(expression_matrix) == rownames(pheno_data))
+
+```
+
+# 3. DESeq2
+
+## Crear Objeto `DESeq2` y contraste con ambos tipos celulares
+```{r deseq2-setup, message=FALSE}
+# Renombrar la columna
+colnames(pheno_data)[colnames(pheno_data) == "genotype:ch1"] <- "genotype"
+
+# Convertir en factor (con niveles adecuados)
+pheno_data$genotype <- factor(pheno_data$genotype)
+
+# Verifica que los niveles están bien
+levels(pheno_data$genotype)
+
+# Crear objeto DESeq2
+dds <- DESeqDataSetFromMatrix(
+  countData = expression_matrix,
+  colData = pheno_data,     
+  design = ~ genotype  # Esta columna separa por tipo/condición
+)
+
+# Filtrado: eliminar genes con muy baja expresión
+dds_filtered <- dds[rowSums(counts(dds)) > 10, ] # Método que recomienda el equipo de DESeq2
+
+# Comenzar análisis
+dds_filtered <- DESeq(dds_filtered)  # Calculo de factores 
+
+# DEFINIMOS EL CONTRASTE
+res <- results(dds_filtered, contrast = c("genotype", "Cadasil", "WT"))  
+
+# Visualizar resultados
+head(res[order(res$pvalue), ])
+```
+
+Ahora tenemos:
+- La **matriz de expresión** completa y normalizada (automáticamente por `DESeq2`)
+- El **diseño experimental (`colData`)** con tipo celular y condición.
+- El objeto `dds` de `DESeq2` para explorar dianas terapéuticas diferenciales en CADASIL.
+
+<https://bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#why-un-normalized-counts>
+
+# 4. PCA de los genes diferencialmente expresados para el contraste con ambos tipos celulares
+```{r}
+library(DESeq2)
+
+# Elegir genes con FDR < 0.05
+sig_genes <- rownames(res)[which(res$padj < 0.05)]
+
+# Filtrar la matriz normalizada
+vsd <- vst(dds_filtered, blind = TRUE)  # transformación estabilizadora de varianza: escala log y suavizados
+vsd_mat <- assay(vsd)[sig_genes, ]      # solo genes significativos
+
+
+# Transponer la matriz: muestras como filas, genes como columnas
+pca <- prcomp(t(vsd_mat), scale. = TRUE)
+
+# Preparar dataframe para ggplot
+pca_data <- data.frame(pca$x[, 1:2])
+pca_data$sample <- rownames(pca_data)
+pca_data$condition <- colData(dds_filtered)$genotype
+pca_data$cell_type <- colData(dds_filtered)$`source_name_ch1`
+
+# Graficar
+library(ggplot2)
+(pca <- ggplot(pca_data, aes(PC1, PC2, color = condition, shape = cell_type)) +
+  geom_point(size = 4) +
+  labs(title = "PCA - genes más significativos CADASIL", x = "PC1", y = "PC2") +
+  theme_minimal())
+
+```
+
+Hay diferencias significativas entre condiciones y tipos celulares por lo que crearemos un objeto `DESeq2` para cada tipo celular y así estudiar genes diferencialmente expresados en células con y sin la enfermedad.
+
+Exportar como png.
+```{r}
+ggsave("Figuras_tfm/pca_cadasil.png", plot = pca, width = 8, height = 6)
+```
+
+
+
+# Contraste para cada tipo celular:
+
+# 5. Filtrado de Muestras 
+
+## Tipo VSMC
+
+Las células musculares lisas vasculares (VSMC), son especialmente relevantes para NOTCH3 y CADASIL.
+```{r}
+vsmc_samples <- which(grepl("smooth muscle", pheno_data$source_name_ch1, ignore.case = TRUE))
+dds_vsmc <- dds_filtered[, vsmc_samples]
+
+# Asegurar que los factores estén limpios
+dds_vsmc$genotype <- droplevels(dds_vsmc$genotype)
+
+```
+
+
+## Tipo EC
+
+Las células endoteliales vasculares (VECs) están implicadas en la disfunción vascular.
+```{r}
+ec_samples <- which(grepl("endothelial", pheno_data$source_name_ch1, ignore.case = TRUE))
+dds_ec <- dds_filtered[, ec_samples]
+
+# Asegurar que los factores estén limpios
+dds_ec$genotype <- droplevels(dds_ec$genotype)
+
+```
+
+
+
+
+## 6. Análisis DESeq2 
+
+## Tipo VSMC
+```{r}
+dds_vsmc <- DESeq(dds_vsmc)
+res_vsmc <- results(dds_vsmc, contrast = c("genotype", "Cadasil", "WT"))
+```
+
+## Tipo EC
+
+```{r}
+dds_ec <- DESeq(dds_ec)
+res_ec <- results(dds_ec, contrast = c("genotype", "Cadasil", "WT"))
+```
+
+# 7. Anotación con `biomaRt`
+
+## Tipo VSMC
+```{r}
+# Añadir anotación 
+res_vsmc_df <- as.data.frame(res_vsmc)
+res_vsmc_df$gene_id <- rownames(res_vsmc_df)
+
+# biomaRt para añadir external_gene_name
+mart <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+annots <- getBM(attributes = c("ensembl_gene_id", "external_gene_name"),
+                filters = "ensembl_gene_id",
+                values = rownames(res_vsmc_df),
+                mart = mart)
+
+# Unir
+res_vsmc_annot <- merge(res_vsmc_df, annots, by.x = "gene_id", by.y = "ensembl_gene_id")
+```
+
+**Comprobar si está "NOTCH3"**
+```{r}
+res_vsmc_annot[res_vsmc_annot$external_gene_name == "NOTCH3", ]
+```
+
+## Tipo EC
+```{r}
+# Añadir anotación 
+res_ec_df <- as.data.frame(res_ec)
+res_ec_df$gene_id <- rownames(res_ec_df)
+
+# biomaRt para añadir external_gene_name
+mart <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+annots <- getBM(attributes = c("ensembl_gene_id", "external_gene_name"),
+                filters = "ensembl_gene_id",
+                values = rownames(res_ec_df),
+                mart = mart)
+
+# Unir
+res_ec_annot <- merge(res_ec_df, annots, by.x = "gene_id", by.y = "ensembl_gene_id")
+```
+
+**Comprobar si está "NOTCH3"**
+```{r}
+res_ec_annot[res_ec_annot$external_gene_name == "NOTCH3", ]
+```
+
+
+# 8. Visualizar genes significativos
+
+## Tipo VSMC
+```{r}
+# Filtrado según P-valor y log2FoldChange
+sig_genes_vsmc <- res_vsmc_annot[
+  !is.na(res_vsmc_annot$padj) &
+  res_vsmc_annot$padj < 0.05 &
+  abs(res_vsmc_annot$log2FoldChange) > 0.5, ]
+
+head(sig_genes_vsmc[order(sig_genes_vsmc$padj), ])
+```
+
+### Heatmap VSMC
+```{r}
+library(pheatmap)
+
+# Usando la tabla anotada y filtrando por p-valor ajustado
+top_genes <- head(sig_genes_vsmc[order(sig_genes_vsmc$padj), ], 50)   # Seleccionamos el top 50
+
+# Extraer nombres comunes
+gene_symbols <- na.omit(top_genes$external_gene_name) # Filtrar NAs
+
+# Transformación con VST 
+vsd_vsmc <- vst(dds_vsmc, blind = FALSE)
+
+# Estable los nombres de vsd_vsmc a nombres comunes como filas de la matriz
+rownames(vsd_vsmc) <- res_vsmc_annot$external_gene_name[
+  match(rownames(vsd_vsmc), res_vsmc_annot$gene_id)
+]
+
+# Eliminar genes sin nombre asignado
+vsd_vsmc <- vsd_vsmc[!is.na(rownames(vsd_vsmc)), ]
+
+# Asegurarse de que solo se usen genes presentes en vsd_vsmc
+gene_symbols <- gene_symbols[gene_symbols %in% rownames(vsd_vsmc)]
+
+# Subset utilizado en el heatmap
+mat <- assay(vsd_vsmc)[gene_symbols, ]
+mat_scaled <- t(scale(t(mat)))
+
+# Anotacion de las muestras para distinguir qué columnas (muestras) pertenecen a cada condición.
+annotation_col <- as.data.frame(colData(dds_vsmc)[, "genotype", drop = FALSE])
+
+# Grafico heatmap
+pheatmap(mat_scaled,
+         annotation_col = annotation_col,
+         main = "Top 50 Genes diferencialmente expresados (VSMC)",
+         cluster_cols = TRUE, cluster_rows = TRUE)
+
+```
+
+Exportar el archivo a png.
+```{r}
+# Crear el heatmap con mayor tamaño de letra en las filas
+png("Figuras_tfm/pheatmap_genes_vsmc.png", width = 1200, height = 1800, res = 150)
+
+pheatmap(mat_scaled,
+         annotation_col = annotation_col,
+         main = "Top 50 Genes diferencialmente expresados (VSMC)",
+         cluster_cols = TRUE,
+         cluster_rows = TRUE,
+         fontsize_row = 10)  
+
+dev.off()
+
+```
+
+
+## Tipo EC
+```{r}
+# Filtrado según P-valor ajustado y log2FoldChange
+sig_genes_ec <- res_ec_annot[!is.na(res_ec_annot$padj) &
+                               res_ec_annot$padj < 0.05 &
+                               abs(res_ec_annot$log2FoldChange) > 0.5, ]
+
+head(sig_genes_ec[order(sig_genes_ec$padj), ])
+```
+
+
+### Heatmap
+```{r}
+library(pheatmap)
+
+# Revisar los nombres disponibles en el objeto VST
+vsd_ec <- vst(dds_ec, blind = FALSE)
+vsd_rownames <- rownames(vsd_ec)
+
+# Crear mapeo entre gene_id y external_gene_name
+gene_map <- res_ec_annot[, c("gene_id", "external_gene_name")]
+
+# Ver cuántos coinciden con vsd_rownames y están bien mapeados
+mapped_names <- gene_map$external_gene_name[match(vsd_rownames, gene_map$gene_id)]
+
+# Asignar nombres comunes a las filas de vsd_ec solo si existen
+rownames(vsd_ec) <- mapped_names
+vsd_ec <- vsd_ec[!is.na(rownames(vsd_ec)) & rownames(vsd_ec) != "", ]
+
+# Filtrar genes significativos y asegurar que estén en vsd
+
+top_genes_ec <- head(sig_genes_ec[order(sig_genes_ec$padj), ], 50)   # Seleccionamos el top 50
+gene_symbols_ec <- na.omit(top_genes_ec$external_gene_name)
+gene_symbols_ec <- gene_symbols_ec[gene_symbols_ec %in% rownames(vsd_ec)]
+
+# Crear matriz de expresión
+mat <- assay(vsd_ec)[gene_symbols_ec, , drop = FALSE]
+mat_scaled <- t(scale(t(mat)))                           #  escalar por fila (gen)
+annotation_col <- as.data.frame(colData(dds_ec)[, "genotype", drop = FALSE])
+
+# 8. Crear el heatmap
+pheatmap::pheatmap(mat_scaled,
+                   annotation_col = annotation_col,
+                   main = "Top 50 Genes diferencialmente expresados (EC)",
+                   cluster_cols = TRUE,
+                   cluster_rows = TRUE,
+                   fontsize_row = 10)
+
+```
+
+Exportar el archivo a png.
+```{r}
+# Crear el heatmap con mayor tamaño de letra en las filas
+png("Figuras_tfm/pheatmap_genes_ec.png", width = 1200, height = 1800, res = 150)
+
+pheatmap(mat_scaled,
+         annotation_col = annotation_col,
+         main = "Top 50 Genes diferencialmente expresados (EC)",
+         cluster_cols = TRUE,
+         cluster_rows = TRUE,
+         fontsize_row = 10)  
+
+dev.off()
+
+```
+
+### Significación biológica comparativa entre ambos tipos celulares
+```{r}
+library(org.Hs.eg.db)
+library(clusterProfiler)
+
+genes_ec_entrez <- bitr(sig_genes_ec$gene_id, fromType = "ENSEMBL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+genes_vsmc_entrez <- bitr(sig_genes_vsmc$gene_id, fromType = "ENSEMBL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+
+# Crear lista nombrada para compareCluster
+gene_clusters <- list(
+  EC = genes_ec_entrez$ENTREZID,
+  VSMC = genes_vsmc_entrez$ENTREZID)
+  
+# Comparar procesos biológicos (GO BP)
+go_comp <- compareCluster(
+  geneCluster = gene_clusters,
+  fun = "enrichGO",
+  OrgDb = org.Hs.eg.db,
+  keyType = "ENTREZID",
+  ont = "BP",                # Cambiar a "MF" o "CC"
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.05,
+  readable = TRUE
+)
+
+
+```
+
+```{r}
+# Gráfico tipo dotplot (resumen visual de rutas enriquecidas por grupo)
+(GO_comp <- dotplot(go_comp, showCategory = 6) + ggtitle("Comparativa GO BP: EC vs VSMC"))
+
+```
+
+Exportar como png.
+```{r}
+ggsave("Figuras_tfm/dotplot_GO_BP.png", plot = GO_comp, width = 8, height = 6, dpi = 300)
+```
+
+
+# 9. Agrupar genes diferencialmente expresados de ambos tipos celulares
+
+Si hay genes diferencialmente expresados en común entre ambos tipos celulares y tienen relación con la enfermedad, podrían ser dianas terapéuticas interesantes.
+
+
+## 9.1. Obtener el conjunto de genes Diferencialmente expresados (DE) con sus anotaciones
+```{r}
+library(dplyr)
+
+# Unir las tablas completas de genes DE
+sig_genes_union_df <- bind_rows(sig_genes_ec, sig_genes_vsmc)
+
+# Quitar duplicados por símbolo (gene_id)
+sig_genes_union_df <- sig_genes_union_df %>%
+  mutate(padj_rank = rank(padj)) %>%
+  arrange(gene_id, padj_rank) %>%
+  distinct(gene_id, .keep_all = TRUE)
+
+# Ver cuántos genes únicos por símbolo
+nrow(sig_genes_union_df)  # Por símbolo HGNC
+```
+
+Comprobar si el gen clave de esta enfermedad `NOTCH3` está incluido.
+```{r}
+"NOTCH3" %in% sig_genes_union_df$external_gene_name
+```
+
+
+
+### Análisis de enriquecimiento GO (Funciones y procesos biológicos jerárquicos)
+```{r}
+# Cargar paquetes necesarios
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+# Extraer Ensembl IDs de los genes comunes significativos en EC y VSMC
+sig_genes_ensembl <- sig_genes_union_df$gene_id
+
+# Análisis de enriquecimiento GO (Biological Process)
+ego <- enrichGO(
+  gene         = sig_genes_ensembl,
+  OrgDb        = org.Hs.eg.db,      # Base de datos de anotación para humanos
+  keyType      = "ENSEMBL",         # Tipo de ID que estás usando (Ensembl)
+  ont          = "BP",              # Tipo de ontología GO: BP, CC o MF
+  pAdjustMethod = "BH",             # Corrección por FDR
+  qvalueCutoff = 0.05,              # Umbral FDR para significancia
+  readable     = TRUE               # Convierte a símbolos de gen legibles si puede
+)
+
+# Visualizar los términos GO enriquecidos más representativos
+(GO_comun <- barplot(ego, showCategory = 12, title = "Enriquecimiento GO - Genes comunes EC/VSMC"))
+
+```
+
+Exportar como png.
+```{r}
+ggsave("Figuras_tfm/dotplot_GO_BP_comun.png", plot = GO_comun, width = 8, height = 6, dpi = 300)
+```
+
+### Análisis de enriquecimiento KEGG (Rutas metabólicas y de señalización)
+```{r}
+# Cargar paquetes necesarios
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+# Convertir IDs Ensembl en Entrez
+genes_entrez <- bitr(
+  sig_genes_ensembl,       # <- estos vienen de final_common$gene_id
+  fromType = "ENSEMBL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+)
+
+# Verifica el mapeo
+head(genes_entrez)
+
+```
+
+
+**Enriquecimiento funcional KEGG** 
+```{r}
+ekegg <- enrichKEGG(
+  gene          = genes_entrez$ENTREZID,
+  organism      = "hsa",       # Homo sapiens
+  pAdjustMethod = "BH",        # Corrección por FDR
+  qvalueCutoff  = 0.05         # Umbral FDR
+)
+
+# Visualización de resultados KEGG
+# Ver las rutas más significativas
+head(ekegg, 8)
+
+# Gráfico de barras con las 10 más representativas
+(kegg_comun <- barplot(ekegg, showCategory = 12, title = "Enriquecimiento KEGG - Genes CADASIL (EC/VSMC)"))
+```
+
+Exportar como png.
+```{r}
+ggsave("Figuras_tfm/dotplot_KEGG_comun.png", plot = kegg_comun, width = 8, height = 6, dpi = 300)
+```
+
+## 9.4 Construcción de la red PPI
+
+```{r}
+library(dplyr)
+library(STRINGdb)
+library(igraph)
+
+# Inicializar conexión con STRING para humanos
+string_db <- STRINGdb$new(
+  version = "11.5",
+  species = 9606,
+  score_threshold = 400,
+  input_directory = ""
+)
+
+# Mapear ENSEMBL gene_id a STRING IDs
+mapped <- string_db$map(
+  sig_genes_union_df,
+  "gene_id",
+  removeUnmappedRows = TRUE
+)
+
+# Eliminar duplicados de STRING_id en el mapeo
+mapped_unique <- mapped %>%
+  distinct(STRING_id, .keep_all = TRUE)
+
+# Obtener interacciones entre genes mapeados
+ppi_data <- string_db$get_interactions(mapped_unique$STRING_id)
+
+# Eliminar duplicados exactos entre pares from–to
+ppi_data_clean <- ppi_data %>%
+  distinct(from, to, .keep_all = TRUE)
+
+# Crear grafo de interacciones
+ppi_graph <- graph_from_data_frame(ppi_data_clean, directed = FALSE)
+
+# Añadir símbolo del gen como atributo de cada nodo del grafo
+V(ppi_graph)$symbol <- mapped_unique$external_gene_name[
+  match(V(ppi_graph)$name, mapped_unique$STRING_id)
+]
+```
+
+**Nº de nodos e Interacciones de la red PPI.**
+```{r}
+# Número de nodos (genes únicos en la red)
+num_nodos <- vcount(ppi_graph)
+
+# Número de interacciones (aristas entre genes)
+num_interacciones <- ecount(ppi_graph)
+
+# Mostrar resultados
+cat("Número de nodos:", num_nodos, "\n")
+cat("Número de interacciones:", num_interacciones, "\n")
+```
+
+**Obtención del archivo csv con las interacciones de la red PPI**
+```{r eval=FALSE, include=FALSE}
+# Añadir los nombres de los genes a las interacciones ya limpias
+ppi_export <- ppi_data_clean %>%
+  mutate(
+    Gene_A = mapped_unique$external_gene_name[match(from, mapped_unique$STRING_id)],
+    Gene_B = mapped_unique$external_gene_name[match(to, mapped_unique$STRING_id)]
+  ) %>%
+  # Eliminar interacciones redundantes por símbolo 
+  distinct(Gene_A, Gene_B, .keep_all = TRUE) %>%
+  dplyr::select(Gene_A, Gene_B, everything())
+
+# Guardar la tabla como CSV
+write.csv(ppi_export, "red_ppi_CADASIL.csv", row.names = FALSE)
+
+# Mostrar primeras filas
+head(ppi_export)
+
+```
+
+El campo `combined_score` representa el nivel de confianza (o peso) de la interacción entre dos proteínas en la base de datos STRING. Esta puntuación es un valor numérico entre 0 y 1000, y se calcula integrando múltiples fuentes de evidencia (<https://string-db.org/help/faq/>). A partir de 400 es una fiabilidad moderada. 
+
+**Gráfico de la Red PPI para los 100 nodos más conectados**
+```{r}
+library(igraph)
+library(ggraph)
+library(tidygraph)
+
+# Calcular grado (número de conexiones por nodo)
+node_degree <- degree(ppi_graph, mode = "all")
+
+# Filtrar nodos con grado alto (por ejemplo, top 50)
+top_n <- 100
+top_nodes <- names(sort(node_degree, decreasing = TRUE))[1:top_n]
+
+# Subgrafo con los nodos más conectados
+subgraph <- induced_subgraph(ppi_graph, vids = top_nodes)
+
+# Usar layout con mejor separación
+set.seed(123)  # Para reproducibilidad
+layout <- layout_with_fr(subgraph)
+
+# Graficar
+# Convertir a tidygraph con símbolo como etiqueta
+graph_tbl <- as_tbl_graph(subgraph) %>%
+  mutate(symbol = V(subgraph)$symbol)
+
+# Visualización con etiquetas destacadas
+(p <- ggraph(graph_tbl, layout = "fr") + 
+  geom_edge_link(alpha = 0.3, color = "lightblue") +
+  geom_node_point(color = "steelblue", size = 5) +
+  geom_node_text(aes(label = symbol),
+                 repel = TRUE,
+                 size = 3.5,
+                 fontface = "bold",
+                 color = "darkgreen") +
+  theme_graph(base_family = "Arial") +
+  ggtitle("Red PPI CADASIL – Top 100 genes más conectados"))
+
+
+```
+
+```{r}
+# Guardar como PNG
+ggsave("Figuras_tfm/ppi_cadasil_top60.png", plot = p, width = 10, height = 8, dpi = 300)
+```
+
+
+**COMPROBAR, EN UN TOP 100 CUANTOS Y CUÁLES COINCIDEN YA CON LOS GENES DE INTERÉS:** 
+```{r}
+# Lista de genes de interés
+genes_interes <- c("APP", "MAPT", "MTBT1", "APOE", "CD2AP", "CLU", "PICALM", 
+                   "BIN1", "TREM2", "SOD1", "SORL1", "ABCA7", "ATP8B4", "ABCA1", 
+                   "NPEPPS", "HSD17B10", "ADAMTS4", "CTSD", "GSK3A", "GSK3B", 
+                   "GRN", "PSAP", "ISM2", "CARF", "RABGGTA", "CTSB", "OPRS1", "AChE", "BDNF", "NTRK2", "NOS3", "AKT1", "TGFB1", "MYC", "TP53")
+
+
+# Encontrar coincidencias
+intersect(V(subgraph)$symbol, genes_interes)
+```
+
+
+**Visualizaciones Interactivas con visNetwork**
+
+Permite seleccionar un gen y ver sus interacciones.
+```{r}
+library(visNetwork)
+library(igraph)
+
+# Convertir a data.frames para visNetwork
+nodes_df <- data.frame(id = V(subgraph)$name, label = V(subgraph)$symbol)
+edges_df <- as_data_frame(subgraph, what = "edges")
+
+# Visualización interactiva
+visNetwork(nodes_df, edges_df) %>%
+  visOptions(highlightNearest = TRUE, nodesIdSelection = TRUE) %>%
+  visPhysics(solver = "forceAtlas2Based") %>%
+  visLayout(randomSeed = 123) %>%
+  visInteraction(navigationButtons = TRUE)
+
+```
+
+
+
+
+```{r}
+library(visNetwork)
+library(igraph)
+library(htmltools)
+
+# Crear data.frame de nodos con desplazamiento vertical de etiquetas
+nodes_df <- data.frame(
+  id = V(subgraph)$name,
+  label = V(subgraph)$symbol,
+  size = 30,                  # Aumenta el tamaño del nodo
+  font.size = 18,             # Tamaño grande
+  font.bold = TRUE,           # Negrita
+  font.vadjust = -50          # Desplaza la etiqueta hacia arriba
+)
+
+# Crear data.frame de aristas
+edges_df <- as_data_frame(subgraph, what = "edges")
+
+# Visualización interactiva
+tagList(
+  tags$div(
+    style = "text-align: center; margin-bottom: 10px;",
+    tags$h3("Red PPI CADASIL – Top 50 genes más conectados")
+  ),
+  visNetwork(nodes_df, edges_df) %>%
+    visEdges(smooth = FALSE) %>%
+    visPhysics(solver = "forceAtlas2Based") %>%
+    visLayout(randomSeed = 123) %>%
+    visInteraction(navigationButtons = TRUE))
+
+
+```
+
+
+**Exortar grafo interactivo**
+```{r}
+visNetwork(nodes_df, edges_df) %>%
+  visExport(type = "png") %>%
+  htmlwidgets::saveWidget(file = "Figuras_tfm/red_ppi_CADASIL.html")
+
+```
+
+
+
+
+**Comprobación de Genes no mapeados**
+```{r eval=FALSE, include=FALSE}
+# Genes originales (símbolos HGNC)
+genes_originales <- sig_genes_union_df$external_gene_name
+
+# Genes que se han mapeado correctamente a STRING
+genes_mapeados <- mapped$external_gene_name
+
+# Obtener los genes que no se han podido mapear
+genes_no_mapeados <- setdiff(genes_originales, genes_mapeados)
+
+# Resultados
+length(genes_no_mapeados)  # Número de genes no mapeados
+head(genes_no_mapeados)    # Ejemplo de genes no mapeados
+
+```
+
+
+
+**Validez de los símbolos**.
+```{r eval=FALSE, include=FALSE}
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+# Validar qué símbolos no mapeados a STRING son reconocidos como genes humanos
+bitr_check <- bitr(
+  genes_no_mapeados,        # Lista de símbolos no mapeados
+  fromType = "SYMBOL",      # Tipo de ID de entrada
+  toType = "ENTREZID",      # A qué queremos mapear
+  OrgDb = org.Hs.eg.db      # Base de datos de genes humanos
+)
+
+# ¿Cuántos símbolos no mapeados a STRING sí son válidos como genes humanos?
+nrow(bitr_check)
+```
+Un pequeño porcentaje no se pudo mapear quizas porque no están en la base de datos de `org.Hs.eg.db` (pseudogenes, lncRNA, genes desactualizados).
+
+
+**Genes con Ensembl ID pero no símbolo**
+```{r eval=FALSE, include=FALSE}
+missing_symbols <- sig_genes_union_df %>%
+  filter(is.na(external_gene_name) | external_gene_name == "")
+
+(missing_symbols)
+
+```
+
+Habría que introducirlos manualmente. 
+
+
+## 9.5 Obtención del dataframe de características de la red PPI y sus genes
+
+### 9.5.1 Métricas de centralidad para cada gen.
+```{r}
+library(igraph)
+library(dplyr)
+
+# Calcular métricas de centralidad
+metrics <- data.frame(
+  Gene = V(ppi_graph)$symbol,
+  Degree = degree(ppi_graph),
+  Degree_Centrality = degree(ppi_graph, normalized = TRUE),
+  Betweenness_Centrality = betweenness(ppi_graph, normalized = TRUE),
+  Closeness_Centrality = closeness(ppi_graph, normalized = TRUE),
+  Eigenvector_Centrality = evcent(ppi_graph)$vector,
+  K_core = coreness(ppi_graph),
+  PageRank = page.rank(ppi_graph)$vector,
+  Clustering_Coefficient = transitivity(ppi_graph, type = "local", isolates = "zero")
+)
+
+# Ver primeras filas
+head(metrics)
+
+```
+
+
+### 9.5.2 Número de Ortólogos para cada gen.
+```{r}
+# Cargamos librerías necesarias:
+library(httr)        # Para hacer peticiones HTTP (GET en este caso)
+library(jsonlite)    # Para manejar y convertir datos en formato JSON
+library(dplyr)       # Para manipulación de datos (aunque aquí no se usa directamente)
+
+# Definimos función para obtener el número de ortólogos de un gen
+get_orthologs <- function(gene_name, species = "human") {
+  # Construimos la URL de la API de Ensembl REST para obtener homologías
+  url <- paste0("https://rest.ensembl.org/homology/symbol/", species, "/", gene_name, "?content-type=application/json")
+  
+  # Solicitud GET a la API
+  response <- GET(url)
+  
+  # Verificamos si la solicitud fue exitosa (código 200 = OK)
+  if (status_code(response) == 200) {
+    # Parseamos el contenido de la respuesta como un objeto R desde JSON
+    data <- content(response, as = "parsed", type = "application/json")
+    
+    # Verificamos si hay datos válidos y si existen homologías para el gen
+    if (!is.null(data$data) && length(data$data) > 0 && !is.null(data$data[[1]]$homologies)) {
+      # Devolvemos el número de ortólogos encontrados
+      return(length(data$data[[1]]$homologies))
+    } else {
+      # Si no hay homólogos, devolvemos 0
+      return(0)
+    }
+  } else {
+    # Si la solicitud falla, devolvemos NA para indicar un error
+    return(NA)
+  }
+}
+
+
+```
+
+
+```{r}
+# Aplicar a los genes de la red PPI
+genes_ppi <- metrics$Gene  # o cualquier vector de nombres de gen
+
+# Esto puede tardar unas horas según el número de genes
+ortholog_counts <- sapply(genes_ppi, get_orthologs)
+
+# Convertir a data.frame
+df_orthologs <- data.frame(
+  Gene = names(ortholog_counts),
+  Num_Orthologs = ortholog_counts
+)
+
+# Ver resultados
+head(df_orthologs)
+
+```
+
+
+### 9.5.3 Número de Fármacos por Gen
+```{r}
+library(httr)
+library(jsonlite)
+library(dplyr)
+
+```
+
+Definir la función para consultar DGIdb por gen.
+```{r}
+get_drug_info <- function(gene_name) {
+  # URL del endpoint de la API de DGIdb (GraphQL)
+  url <- "https://dgidb.org/api/graphql"
+  
+  # Construcción de la consulta en formato GraphQL
+  query <- paste0(
+    '{ genes(names: ["', gene_name, '"]) { nodes { name interactions { drug { name } interactionScore sources { sourceDbName } } } } }'
+  )
+  
+  # Realizar la petición POST con el cuerpo en formato JSON
+  response <- POST(url, body = list(query = query), encode = "json")
+  
+  # Introducir una pequeña pausa para evitar saturar el servidor (opcional pero recomendable)
+  Sys.sleep(0.2)
+
+  # Si la petición fue exitosa (código HTTP 200)
+  if (status_code(response) == 200) {
+    # Parsear el contenido como lista (manteniendo estructura anidada)
+    data <- content(response, as = "parsed", simplifyVector = FALSE)
+    
+    # Extraer los nodos (lista de genes encontrados por DGIdb)
+    nodes <- data$data$genes$nodes
+    
+    # Si hay al menos un gen y contiene interacciones
+    if (length(nodes) > 0 && !is.null(nodes[[1]]$interactions)) {
+      interactions <- nodes[[1]]$interactions
+      
+      # Extraer datos de cada interacción
+      drug_info <- lapply(interactions, function(interaction) {
+        list(
+          Gene = gene_name,  # Nombre del gen
+          Drug = interaction$drug$name,  # Nombre del fármaco
+          Score = interaction$interactionScore,  # Score de interacción
+          Source = paste(  # Fuentes de la interacción
+            vapply(interaction$sources, function(s) s$sourceDbName, character(1)),
+            collapse = ", "
+          )
+        )
+      })
+      
+      # Combinar todas las interacciones en un único data.frame
+      return(bind_rows(drug_info))
+    }
+    
+  } else {
+    # Si la petición falló, mostrar advertencia
+    warning(paste("Error", status_code(response), "al recuperar", gene_name))
+  }
+  
+  # Si no se encontró nada o hubo error, devolver NULL
+  return(NULL)
+}
+
+```
+
+
+Aplicar la función al conjunto de genes.
+```{r}
+drug_results <- lapply(genes_ppi, get_drug_info)
+
+# Combinar todas las respuestas en un solo data.frame
+df_interactions <- bind_rows(drug_results)
+
+# Verificar
+head(df_interactions)
+```
+
+`InteractionScore`: medida estática de la fuerza y especificidad de una interacción entre un gen y un fármaco, independiente del contexto de búsqueda.
+
+Se calcula a partir de:
+
+`Evidence Score`: número de publicaciones y bases de datos que apoyan la interacción.
+
+`Especificidad de la interacción`: si el gen o el fármaco están involucrados en muchas otras interacciones, el score se penaliza (porque son "promiscuos").
+
+Interpretación: 
+`Valores altos (~10 o más) → Fuerte respaldo, múltiples fuentes y referencias.
+
+Valores intermedios (2–9) → Relación conocida, pero con menos soporte.
+
+Valores bajos (<1) → Relación débil, potencialmente basada en una sola fuente o evidencia preliminar.
+
+Freshour, S. L., Kiwala, S., Cotto, K. C., Coffman, A. C., McMichael, J. F., Song, J. J., Griffith, M., Griffith, O. L., & Wagner, A. H. (2021). Integration of the Drug–Gene Interaction Database (DGIdb 4.0) with open crowdsource efforts. Nucleic Acids Research, 49(D1), D1144–D1151. <https://doi.org/10.1093/nar/gkaa1084> 
+
+
+Contar número de fármacos por gen.
+```{r}
+library(dplyr)
+
+# Suponiendo que tienes un data.frame con columnas: Gene y Drug
+# Por ejemplo: df_interactions <- data.frame(Gene = ..., Drug = ...)
+
+# Contar el número de fármacos únicos por gen
+drug_counts <- df_interactions %>%
+  group_by(Gene) %>%
+  summarise(Num_Drugs = n_distinct(Drug)) %>%
+  arrange(desc(Num_Drugs))
+
+# Ver los primeros resultados
+head(drug_counts)
+
+```
+
+
+
+## 9.6 Dataframe final con todas las características por gen.
+
+```{r}
+# Unir métricas de centralidad + número de ortólogos
+cadasil_metrics_df <- metrics %>%
+  left_join(df_orthologs, by = "Gene") %>%
+  left_join(drug_counts, by = "Gene")  # añade número de fármacos
+
+# Reemplazar NA en Num_Orthologs y Num_Drugs por 0 (si lo deseas)
+cadasil_metrics_df <- cadasil_metrics_df %>%
+  mutate(
+    Num_Orthologs = ifelse(is.na(Num_Orthologs), 0, Num_Orthologs),
+    Num_Drugs = ifelse(is.na(Num_Drugs), 0, Num_Drugs)
+  )
+
+# Verificar
+head(cadasil_metrics_df)
+
+# Exportar a csv
+write.csv(cadasil_metrics_df, "caracteristics_ppi_CADASIL.csv", row.names = FALSE)
+```
+
+## 9.7 Información Adicional: Anotaciones funcionales para cada gen.
+```{r eval=FALSE, include=FALSE}
+if (!requireNamespace("biomaRt", quietly = TRUE)) {
+  BiocManager::install("biomaRt")
+}
+library(biomaRt)
+
+# Conectar con Ensembl
+mart <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+```
+
+
+```{r eval=FALSE, include=FALSE}
+# Anotar por símbolo de gen
+gene_annotations <- getBM(
+  attributes = c("hgnc_symbol", "description", "gene_biotype"),
+  filters = "hgnc_symbol",
+  values = cadasil_metrics_df$Gene,
+  mart = mart
+)
+
+# Evitar duplicados
+gene_annotations <- distinct(gene_annotations, hgnc_symbol, .keep_all = TRUE)
+
+```
+
+
+```{r eval=FALSE, include=FALSE}
+head(gene_annotations)
+
+```
+
+
+# 10. Contrucción de la Red PPI y Conjunto de Características para los Genes en común entre el Alzheimer y CADASIL
+
+## 10.1 Preparación de los datos 
+
+### Importamos el fichero con los genes de la enfermedad de Alzheimer**
+```{r, echo=FALSE}
+caracteristics_ppi_ALZ <- read.csv(
+  file.path(params$folder.data, params$file1), 
+  sep=",",            # Especifica que el separador de columnas es una coma
+  dec=".",            # Define que el separador decimal es un punto
+  header=TRUE,        # Indica que la primera fila contiene los nombres de las columnas
+  stringsAsFactors=FALSE # Evita que las columnas se conviertan en factores automáticamente
+)
+```
+
+**Primeras filas.** 
+```{r}
+head(caracteristics_ppi_ALZ)
+```
+
+### Filtrar genes comunes entre CADASIL (`sig_genes_union_df`) y ALZ (`caracteristics_ppi_ALZ`)
+
+```{r}
+library(dplyr)
+
+# Filtrar los genes de sig_genes_union_df que están en caracteristics_ppi_ALZ
+df_genes_Cadasil_Alz <- sig_genes_union_df %>%
+  filter(external_gene_name %in% caracteristics_ppi_ALZ$Gene) %>%
+  dplyr::select(external_gene_name, everything())  # Ubicamos la columna con los nombres de los genes primero
+
+# Ver primeras filas del resultado
+head(df_genes_Cadasil_Alz)
+```
+
+### Mostrar cuántos genes comunes hay
+```{r}
+cat("Número de genes en común entre CADASIL y ALZ:", nrow(df_genes_Cadasil_Alz), "\n")
+```
+
+
+## 10.2 Construcción de la red PPI
+
+```{r}
+library(STRINGdb)
+library(dplyr)
+library(igraph)
+
+# Inicializar conexión con STRING para humanos
+string_db <- STRINGdb$new(
+  version = "11.5",
+  species = 9606,
+  score_threshold = 400,
+  input_directory = ""
+)
+
+# 1. Mapear ENSEMBL gene_id a STRING IDs
+mapped <- string_db$map(
+  df_genes_Cadasil_Alz,
+  "gene_id",
+  removeUnmappedRows = TRUE
+)
+
+# 2. Eliminar duplicados de STRING_id en el mapeo
+mapped_unique <- mapped %>%
+  distinct(STRING_id, .keep_all = TRUE)
+
+# 3. Obtener interacciones entre genes mapeados
+ppi_data <- string_db$get_interactions(mapped_unique$STRING_id)
+
+# 4. Eliminar duplicados exactos entre pares from–to
+ppi_data_clean <- ppi_data %>%
+  distinct(from, to, .keep_all = TRUE)
+
+# 5. Crear grafo de interacciones
+ppi_graph <- graph_from_data_frame(ppi_data_clean, directed = FALSE)
+
+# 6. Añadir símbolo del gen como atributo de cada nodo del grafo
+V(ppi_graph)$symbol <- mapped_unique$external_gene_name[
+  match(V(ppi_graph)$name, mapped_unique$STRING_id)
+]
+```
+
+**Obtención del archivo csv con las interacciones de la red PPI**
+```{r eval=FALSE, include=FALSE}
+# Añadir los nombres de los genes a las interacciones ya limpias
+ppi_export <- ppi_data_clean %>%
+  mutate(
+    Gene_A = mapped_unique$external_gene_name[match(from, mapped_unique$STRING_id)],
+    Gene_B = mapped_unique$external_gene_name[match(to, mapped_unique$STRING_id)]
+  ) %>%
+  # Eliminar interacciones redundantes por símbolo (aunque STRING_id fueran distintos)
+  distinct(Gene_A, Gene_B, .keep_all = TRUE) %>%
+  dplyr::select(Gene_A, Gene_B, everything())
+
+# Guardar la tabla como CSV
+write.csv(ppi_export, "red_ppi_CADASIL_Alz.csv", row.names = FALSE)
+
+# Mostrar primeras filas
+head(ppi_export)
+
+```
+
+El campo `combined_score` representa el nivel de confianza (o peso) de la interacción entre dos proteínas en la base de datos STRING. Esta puntuación es un valor numérico entre 0 y 1000, y se calcula integrando múltiples fuentes de evidencia (<https://string-db.org/help/faq/>). A partir de 400 es una fiabilidad moderada. 
+
+
+**Nº de nodos e Interacciones de la red PPI.**
+```{r}
+# Número de nodos (genes únicos en la red)
+num_nodos <- vcount(ppi_graph)
+
+# Número de interacciones (aristas entre genes)
+num_interacciones <- ecount(ppi_graph)
+
+# Mostrar resultados
+cat("Número de nodos:", num_nodos, "\n")
+cat("Número de interacciones:", num_interacciones, "\n")
+```
+
+
+**Gráfico de la Red PPI para los 50 nodos más interconectados**
+```{r}
+library(igraph)
+
+# Calcular grado (número de conexiones por nodo)
+node_degree <- degree(ppi_graph, mode = "all")
+
+# Filtrar nodos con grado alto (por ejemplo, top 50)
+top_n <- 100
+top_nodes <- names(sort(node_degree, decreasing = TRUE))[1:top_n]
+
+# Subgrafo con los nodos más conectados
+subgraph <- induced_subgraph(ppi_graph, vids = top_nodes)
+
+# Usar layout con mejor separación (ej. Fruchterman-Reingold)
+set.seed(123)  # Para reproducibilidad
+layout <- layout_with_fr(subgraph)
+
+# Graficar
+# Convertir a tidygraph con símbolo como etiqueta
+graph_tbl <- as_tbl_graph(subgraph) %>%
+  mutate(symbol = V(subgraph)$symbol)
+
+# Visualización con etiquetas destacadas
+(p <- ggraph(graph_tbl, layout = "fr") + 
+  geom_edge_link(alpha = 0.3, color = "lightblue") +
+  geom_node_point(color = "steelblue", size = 5) +
+  geom_node_text(aes(label = symbol),
+                 repel = TRUE,
+                 size = 3.5,
+                 fontface = "bold",
+                 color = "darkgreen") +
+  theme_graph(base_family = "Arial") +
+  ggtitle("Red PPI Alzheimer-CADASIL – Top 100 genes más conectados"))
+
+
+```
+
+**Exportar archivo.**
+```{r}
+# Guardar como PNG
+ggsave("Figuras_tfm/ppi_alz_cadasil_top60.png", plot = p, width = 10, height = 8, dpi = 300)
+```
+
+
+**COMPROBAR, EN UN TOP 100 (MODIFICANDO EL GRAFICO) CUANTOS Y CUÁLES COINCIDEN YA CON LOS GENES DE INTERÉS:** 
+```{r}
+# Encontrar coincidencias
+intersect(V(subgraph)$symbol, genes_interes)
+```
+
+
+**Visualizaciones Interactivas con visNetwork**
+
+Permite seleccionar un gen y ver sus interacciones.
+```{r}
+library(visNetwork)
+library(igraph)
+
+# Convertir a data.frames para visNetwork
+nodes_df <- data.frame(id = V(subgraph)$name, label = V(subgraph)$symbol)
+edges_df <- as_data_frame(subgraph, what = "edges")
+
+# Visualización interactiva
+visNetwork(nodes_df, edges_df) %>%
+  visOptions(highlightNearest = TRUE, nodesIdSelection = TRUE) %>%
+  visPhysics(solver = "forceAtlas2Based") %>%
+  visLayout(randomSeed = 123) %>%
+  visInteraction(navigationButtons = TRUE)
+
+```
+
+
+```{r}
+library(visNetwork)
+library(igraph)
+library(htmltools)
+
+# Crear data.frame de nodos con desplazamiento vertical de etiquetas
+nodes_df <- data.frame(
+  id = V(subgraph)$name,
+  label = V(subgraph)$symbol,
+  size = 30,                  # Aumenta el tamaño del nodo
+  font.size = 18,             # Tamaño grande
+  font.bold = TRUE,           # Negrita
+  font.vadjust = -50          # Desplaza la etiqueta hacia arriba
+)
+
+# Crear data.frame de aristas
+edges_df <- as_data_frame(subgraph, what = "edges")
+
+# Visualización interactiva
+tagList(
+  tags$div(
+    style = "text-align: center; margin-bottom: 10px;",
+    tags$h3("Red PPI ALZHEIMER-CADASIL – Top 50 genes más conectados")
+  ),
+  visNetwork(nodes_df, edges_df) %>%
+    visEdges(smooth = FALSE) %>%
+    visPhysics(solver = "forceAtlas2Based") %>%
+    visLayout(randomSeed = 123) %>%
+    visInteraction(navigationButtons = TRUE))
+
+
+```
+
+
+**Exortar grafo interactivo**
+```{r}
+visNetwork(nodes_df, edges_df) %>%
+  visExport(type = "png") %>%
+  htmlwidgets::saveWidget(file = "Figuras_tfm/red_ppi_ALZ_CADASIL.html")
+
+```
+
+
+
+
+**Comprobación de Genes no mapeados**
+```{r eval=FALSE, include=FALSE}
+# Genes originales (símbolos HGNC)
+genes_originales <- df_genes_Cadasil_Alz$external_gene_name
+
+# Genes que se han mapeado correctamente a STRING
+genes_mapeados <- mapped$external_gene_name
+
+# Obtener los genes que no se han podido mapear
+genes_no_mapeados <- setdiff(genes_originales, genes_mapeados)
+
+# Resultados
+length(genes_no_mapeados)  # Número de genes no mapeados
+head(genes_no_mapeados)    # Ejemplo de genes no mapeados
+
+```
+
+
+**Validez de los símbolos**.
+```{r eval=FALSE, include=FALSE}
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+# Validar qué símbolos no mapeados a STRING son reconocidos como genes humanos
+bitr_check <- bitr(
+  genes_no_mapeados,        # Lista de símbolos no mapeados
+  fromType = "SYMBOL",      # Tipo de ID de entrada
+  toType = "ENTREZID",      # A qué queremos mapear
+  OrgDb = org.Hs.eg.db      # Base de datos de genes humanos
+)
+
+# ¿Cuántos símbolos no mapeados a STRING sí son válidos como genes humanos?
+nrow(bitr_check)
+```
+Un pequeño porcentaje no se pudo mapear quizas porque no están en la base de datos de `org.Hs.eg.db` (pseudogenes, lncRNA, genes desactualizados).
+
+
+**Número de Duplicados**
+```{r eval=FALSE, include=FALSE}
+table(duplicated(sig_genes_union_df$external_gene_name))
+```
+
+**Genes con Ensembl ID pero no símbolo**
+```{r eval=FALSE, include=FALSE}
+missing_symbols <- sig_genes_union_df %>%
+  filter(is.na(external_gene_name) | external_gene_name == "")
+
+(missing_symbols)
+
+```
+
+Habría que introducirlos manualmente. 
+
+### 10.2.1 Métricas de centralidad para cada gen.
+```{r}
+library(igraph)
+library(dplyr)
+
+# Calcular métricas
+metrics <- data.frame(
+  Gene = V(ppi_graph)$symbol,
+  Degree = degree(ppi_graph),
+  Degree_Centrality = degree(ppi_graph, normalized = TRUE),
+  Betweenness_Centrality = betweenness(ppi_graph, normalized = TRUE),
+  Closeness_Centrality = closeness(ppi_graph, normalized = TRUE),
+  Eigenvector_Centrality = evcent(ppi_graph)$vector,
+  K_core = coreness(ppi_graph),
+  PageRank = page.rank(ppi_graph)$vector,
+  Clustering_Coefficient = transitivity(ppi_graph, type = "local", isolates = "zero")
+)
+
+# Ver primeras filas
+head(metrics)
+
+```
+
+
+
+### 10.2.2 Número de Ortólogos para cada gen.
+```{r}
+# Cargamos librerías necesarias:
+library(httr)        # Para hacer peticiones HTTP (GET en este caso)
+library(jsonlite)    # Para manejar y convertir datos en formato JSON
+library(dplyr)       # Para manipulación de datos (aunque aquí no se usa directamente)
+
+# Definimos función para obtener el número de ortólogos de un gen
+get_orthologs <- function(gene_name, species = "human") {
+  # Construimos la URL de la API de Ensembl REST para obtener homologías
+  url <- paste0("https://rest.ensembl.org/homology/symbol/", species, "/", gene_name, "?content-type=application/json")
+  
+  # Solicitud GET a la API
+  response <- GET(url)
+  
+  # Verificamos si la solicitud fue exitosa (código 200 = OK)
+  if (status_code(response) == 200) {
+    # Parseamos el contenido de la respuesta como un objeto R desde JSON
+    data <- content(response, as = "parsed", type = "application/json")
+    
+    # Verificamos si hay datos válidos y si existen homologías para el gen
+    if (!is.null(data$data) && length(data$data) > 0 && !is.null(data$data[[1]]$homologies)) {
+      # Devolvemos el número de ortólogos encontrados
+      return(length(data$data[[1]]$homologies))
+    } else {
+      # Si no hay homólogos, devolvemos 0
+      return(0)
+    }
+  } else {
+    # Si la solicitud falla, devolvemos NA para indicar un error
+    return(NA)
+  }
+}
+
+
+```
+
+
+```{r}
+# Aplicar a los genes de la red PPI
+genes_ppi <- metrics$Gene  # o cualquier vector de nombres de gen
+
+# Esto puede tardar unas horas según el número de genes
+ortholog_counts <- sapply(genes_ppi, get_orthologs)
+
+# Convertir a data.frame
+df_orthologs <- data.frame(
+  Gene = names(ortholog_counts),
+  Num_Orthologs = ortholog_counts
+)
+
+# Ver resultados
+head(df_orthologs)
+
+```
+
+
+### 10.2.3 Número de Fármacos por Gen
+```{r}
+library(httr)
+library(jsonlite)
+library(dplyr)
+
+```
+
+Definir la función para consultar DGIdb por gen.
+```{r}
+get_drug_info <- function(gene_name) {
+  # URL del endpoint de la API de DGIdb (GraphQL)
+  url <- "https://dgidb.org/api/graphql"
+  
+  # Construcción de la consulta en formato GraphQL
+  query <- paste0(
+    '{ genes(names: ["', gene_name, '"]) { nodes { name interactions { drug { name } interactionScore sources { sourceDbName } } } } }'
+  )
+  
+  # Realizar la petición POST con el cuerpo en formato JSON
+  response <- POST(url, body = list(query = query), encode = "json")
+  
+  # Introducir una pequeña pausa para evitar saturar el servidor (opcional pero recomendable)
+  Sys.sleep(0.2)
+
+  # Si la petición fue exitosa (código HTTP 200)
+  if (status_code(response) == 200) {
+    # Parsear el contenido como lista (manteniendo estructura anidada)
+    data <- content(response, as = "parsed", simplifyVector = FALSE)
+    
+    # Extraer los nodos (lista de genes encontrados por DGIdb)
+    nodes <- data$data$genes$nodes
+    
+    # Si hay al menos un gen y contiene interacciones
+    if (length(nodes) > 0 && !is.null(nodes[[1]]$interactions)) {
+      interactions <- nodes[[1]]$interactions
+      
+      # Extraer datos de cada interacción
+      drug_info <- lapply(interactions, function(interaction) {
+        list(
+          Gene = gene_name,  # Nombre del gen
+          Drug = interaction$drug$name,  # Nombre del fármaco
+          Score = interaction$interactionScore,  # Score de interacción
+          Source = paste(  # Fuentes de la interacción
+            vapply(interaction$sources, function(s) s$sourceDbName, character(1)),
+            collapse = ", "
+          )
+        )
+      })
+      
+      # Combinar todas las interacciones en un único data.frame
+      return(bind_rows(drug_info))
+    }
+    
+  } else {
+    # Si la petición falló, mostrar advertencia
+    warning(paste("Error", status_code(response), "al recuperar", gene_name))
+  }
+  
+  # Si no se encontró nada o hubo error, devolver NULL
+  return(NULL)
+}
+
+```
+
+
+Aplicar la función al conjunto de genes.
+```{r}
+drug_results <- lapply(genes_ppi, get_drug_info)
+
+# Combinar todas las respuestas en un solo data.frame
+df_interactions <- bind_rows(drug_results)
+
+# Verificar
+head(df_interactions)
+```
+
+
+Contar número de fármacos por gen.
+```{r}
+library(dplyr)
+
+# Suponiendo que tienes un data.frame con columnas: Gene y Drug
+# Por ejemplo: df_interactions <- data.frame(Gene = ..., Drug = ...)
+
+# Contar el número de fármacos únicos por gen
+drug_counts <- df_interactions %>%
+  group_by(Gene) %>%
+  summarise(Num_Drugs = n_distinct(Drug)) %>%
+  arrange(desc(Num_Drugs))
+
+# Ver los primeros resultados
+head(drug_counts)
+
+```
+
+
+
+## 10.3 Dataframe final con todas las características por gen.
+
+```{r}
+# Unir métricas de centralidad + número de ortólogos
+df_genes_Cadasil_Alz <- metrics %>%
+  left_join(df_orthologs, by = "Gene") %>%
+  left_join(drug_counts, by = "Gene")  # añade número de fármacos
+
+# Reemplazar NA en Num_Orthologs y Num_Drugs por 0 (si lo deseas)
+df_genes_Cadasil_Alz <- df_genes_Cadasil_Alz %>%
+  mutate(
+    Num_Orthologs = ifelse(is.na(Num_Orthologs), 0, Num_Orthologs),
+    Num_Drugs = ifelse(is.na(Num_Drugs), 0, Num_Drugs)
+  )
+
+# Verificar
+head(df_genes_Cadasil_Alz)
+
+# Exportar a csv
+write.csv(df_genes_Cadasil_Alz, "caracteristics_ppi_CADASIL_Alz.csv", row.names = FALSE)
+```
+
+

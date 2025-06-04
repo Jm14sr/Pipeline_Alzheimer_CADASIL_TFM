@@ -1,0 +1,458 @@
+---
+title: "TFM_1_PPI_Net"
+author: "Juan Manuel Sancho Romero"
+date: "2025-03-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Instalación de Paquetes
+```{r paquetes, include=FALSE}
+
+# Paquetes de CRAN
+cran_libraries <- c(
+  "caret", "class", "C50", "dplyr", "e1071", "gmodels", 
+  "ggfortify", "ggplot2", "kableExtra", "kernlab", "klaR", 
+  "nortest", "randomForest", "reticulate", "ROCR", "knitr", 
+  "gridExtra", "grid", "ggraph", "threejs", "rgl"
+)
+
+# Instalar paquetes de la lista de CRAN  que faltan
+missing_cran <- setdiff(cran_libraries, installed.packages()[, "Package"])
+if (length(missing_cran) > 0) install.packages(missing_cran)
+
+
+# Paquetes de Bioconductor
+bioc_libraries <- c("biomaRt", "httr2", "org.Hs.eg.db", "clusterProfiler", "AnnotationDbi", "GEOquery")
+
+# Asegurar BiocManager está instalado
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+
+# Instalar los paquetes de la lista de BiocManager que faltan
+missing_bioc <- setdiff(bioc_libraries, installed.packages()[, "Package"])
+if (length(missing_bioc) > 0) BiocManager::install(missing_bioc)
+
+# Cargar todos los paquetes
+invisible(lapply(c(cran_libraries, bioc_libraries), library, character.only = TRUE))
+
+```
+
+Establecer el entorno de `Pyhton` con `tensorFlow`, `Pytorch`, `Networkz` y otras librerías necesarias instaladas.
+```{r}
+library(reticulate)
+reticulate::use_condaenv("tfm_redes", required = TRUE)
+```
+
+
+# 1. Construcción de la Red PPI con el archivo "INTERACTIONS" de BioGRID
+Obtenido de:
+<https://downloads.thebiogrid.org/File/BioGRID/Latest-Release/BIOGRID-PROJECT-alzheimers_disease_project-LATEST.zip>
+
+<https://thebiogrid.org/project/7/alzheimers-disease.html>
+
+Roussarie, J.-P., Yao, V., Rodriguez-Rodriguez, P., Oughtred, R., Rust, J., Plautz, Z., Kasturia, S., Albornoz, C., Wang, W., Schmidt, E. F., Dannenfelser, R., Tadych, A., Brichta, L., Barnea-Cramer, A., Heintz, N., Hof, P. R., Heiman, M., Dolinski, K., Flajolet, M., … Troyanskaya, O. G. (2020). Selective neuronal vulnerability in Alzheimer’s disease: A network-based analysis. Neuron, 107(5), 821-835.e12. <https://doi.org/10.1016/j.neuron.2020.06.010>
+
+
+## 1.1 Importamos el archivo con las interacciones.
+```{python}
+import pandas as pd
+
+# Cargar el archivo
+df_interactions = pd.read_csv(r"C:\Users\juanm\Desktop\MASTER_BIOINFORMATICA\0_TFM_Bioinf\TFM_Resultados\BIOGRID-PROJECT-alzheimers_disease_project-LATEST\INTERACTIONS_BIOGRID_PROJECT_alzheimers_disease_project.txt", sep="\t", 
+low_memory=False) # Evitar problemas de memoria
+ 
+# Primeras filas
+df_interactions.head()
+df_interactions.shape
+```
+
+## 1.2 Filtrado de las columnas necesarias para generar el grafo
+NOTA: Se han filtrado las interacciones genéticas, seleccionando solo las físicas. 
+
+```{python}
+# Filtrar solo interacciones físicas
+df_ppi = df_interactions[df_interactions["Experimental System Type"] == "physical"] # No interesan interacciones genéticas
+
+# Seleccionar solo columnas clave
+df_ppi = df_ppi[["Official Symbol Interactor A", "Official Symbol Interactor B"]]
+
+# Eliminar duplicados
+df_ppi = df_ppi.drop_duplicates()
+
+# Eliminar self-loops para simplificar el grafo
+df_ppi = df_ppi[df_ppi["Official Symbol Interactor A"] != df_ppi["Official Symbol Interactor B"]]
+
+
+# Mostrar las primeras filas
+df_ppi.head()
+
+# Exportar a csv
+df_ppi.to_csv("red_ppi_Alz.csv", index=False)
+```
+
+**Nº de nodos e Interacciones de la red PPI.**
+```{python}
+import pandas as pd
+
+# Calcular el número de nodos únicos
+nodos_unicos = pd.unique(pd.concat([
+    df_ppi['Official Symbol Interactor A'],
+    df_ppi['Official Symbol Interactor B']
+]))
+num_nodos = len(nodos_unicos)
+
+# Calcular el número de interacciones (aristas)
+# Cada fila representa una interacción
+num_interacciones = df_ppi.shape[0]
+
+print(f"Número de nodos únicos: {num_nodos}")
+print(f"Número de interacciones: {num_interacciones}")
+
+```
+
+
+## 1.3 Construcción de la Red PPI
+
+```{python}
+import networkx as nx
+import matplotlib.pyplot as plt
+
+# Crear el grafo desde el DataFrame
+G = nx.from_pandas_edgelist(df_ppi, "Official Symbol Interactor A", "Official Symbol Interactor B")
+
+# Calcular el grado de cada nodo
+node_degree = dict(G.degree())
+
+# Seleccionar los 300 nodos más conectados
+top_nodes = sorted(node_degree, key=node_degree.get, reverse=True)[:100]
+
+# Crear un subgrafo con estos nodos
+G_sub = G.subgraph(top_nodes)
+
+# Usar un layout más expandido
+pos = nx.spring_layout(G_sub, k=2)  # k controla la dispersión de los nodos
+
+# Dibujar la red
+plt.figure(figsize=(16, 14))
+nx.draw(G_sub, pos, with_labels=False, node_size=40, edge_color="gray", alpha=0.6, width=0.5)
+
+# Identificar los nodos más conectados y etiquetarlos
+high_degree_nodes = [n for n, d in G_sub.degree() if d > 30]
+nx.draw_networkx_nodes(G_sub, pos, nodelist=high_degree_nodes, node_size=100, node_color="red")
+
+# Añadir etiquetas solo a los nodos clave
+labels = {n: n for n in high_degree_nodes}
+nx.draw_networkx_labels(G_sub, pos, labels, font_size=8, font_color="black")
+
+plt.title("Red PPI con los 300 nodos más conectados (mejor distribuida)")
+plt.show()
+
+```
+
+Lista de los genes con mayor número de interacciones (centralidad alta).
+```{python}
+import pandas as pd
+
+# Extraer los genes más conectados (nodos con mayor grado)
+top_genes = sorted(node_degree, key=node_degree.get, reverse=True)[:100]
+
+# Guardar la lista en un archivo CSV
+df_top_genes = pd.DataFrame(top_genes, columns=["Gene"])
+
+print("Lista de los 100 genes más conectados guardada en 'top_100_genes_ppi.csv'")
+
+```
+
+## 1.4 Búsqueda de Fármacos aprobados para cada gen y Red Gen-Fármaco
+
+Código modificado del repositorio: 
+Find drug gene interaction partners using API.py -  <https://github.com/farhanhaqj/Python-Scripts/blob/0cfc61ee25c43989889bc358f5d31b26250280c6/Find%20drug%20gene%20interaction%20partners%20using%20API.py>
+
+### 1.4.1 Función para obtener interacciones entre un gen y fármacos usando la API de DGIdb (Drug Gene Interaction Database).
+```{python}
+import requests
+import pandas as pd
+import networkx as nx
+import matplotlib.pyplot as plt
+
+def get_drug_info(gene_name):
+    drug_info = []  # Lista donde se guardarán las interacciones encontradas
+    base_url = "https://dgidb.org/api/graphql"  # Endpoint de la API (formato GraphQL)
+    
+    # Definimos la consulta GraphQL para obtener los fármacos que interactúan con el gen
+    query = f"""
+    {{
+      genes(names: ["{gene_name}"]) {{
+        nodes {{
+          name
+          interactions {{
+            drug {{
+              name
+            }}
+            interactionScore
+            sources {{
+              sourceDbName
+            }}
+          }}
+        }}
+      }}
+    }}
+    """
+    
+    # Hacemos la solicitud POST con la consulta como JSON
+    response = requests.post(base_url, json={'query': query})
+    
+    # Si la consulta fue exitosa (HTTP 200)
+    if response.status_code == 200:
+        data = response.json()
+        # Extraemos los nodos que representan al gen consultado
+        gene_data = data.get('data', {}).get('genes', {}).get('nodes', [])
+        
+        # Si el gen tiene datos disponibles
+        if gene_data:
+            gene = gene_data[0]
+            interactions = gene.get('interactions', [])
+
+            # Recorremos cada interacción y extraemos los detalles relevantes
+            for interaction in interactions:
+                drug_name = interaction.get("drug", {}).get("name", "N/A")
+                
+                # Si el nombre del fármaco es válido, lo añadimos al listado
+                if drug_name != "N/A":
+                    drug_info.append({
+                        "Gene": gene_name,  # nombre del gen consultado
+                        "Drug": drug_name,  # nombre del fármaco
+                        "Score": interaction.get("interactionScore", "N/A"),  # puntuación de interacción
+                        "Source": ", ".join([
+                            source.get("sourceDbName", "") for source in interaction.get("sources", [])
+                        ])  # fuentes bibliográficas o bases de datos
+                    })
+        else:
+            print(f"No interacciones para {gene_name}.")  # Si no se encontró el gen
+    else:
+        print(f"Error {response.status_code} al recuperar {gene_name}")  # Si hubo un error HTTP
+
+    return drug_info  # Devolvemos todas las interacciones encontradas para ese gen
+
+```
+
+### 1.4.2 Crear Red Gen-Fármaco
+```{python}
+import requests
+import pandas as pd
+import networkx as nx
+import matplotlib.pyplot as plt
+
+# Obtener todas las interacciones usando la función anterior
+interactions = []
+for gene in top_genes:
+    interactions.extend(get_drug_info(gene))
+
+# Convertir a DataFrame
+df_interactions = pd.DataFrame(interactions)
+
+# Comprobar si hay datos antes de graficar
+if df_interactions.empty:
+    print("No se encontraron interacciones. Revisa la lista de genes o la API de DGIdb.")
+else:
+    print(f"Se encontraron {len(df_interactions)} interacciones.")
+    print(df_interactions.head())  # Muestra las primeras filas
+
+    # Contar cuántos genes interactúan con cada fármaco
+    drug_counts = df_interactions["Drug"].value_counts()
+
+    # Si hay menos de 10 fármacos en la lista, incluímos los que haya (len(drug_counts))
+    num_top_drugs = min(10, len(drug_counts))
+    
+    # Obtenemos los índices de los fármacos con mayor número de interacciones
+    top_drugs = drug_counts.head(num_top_drugs).index
+
+    # Filtrar solo los 10 fármacos más conectados
+    df_filtered = df_interactions[df_interactions["Drug"].isin(top_drugs)]
+
+    # Construir la red
+    G = nx.Graph()
+
+    for _, row in df_filtered.iterrows():
+        gene = row["Gene"]
+        drug = row["Drug"]
+        
+        # Agregar nodos y aristas
+        G.add_node(gene, type="gene", label=gene)
+        G.add_node(drug, type="drug", label=drug)
+        G.add_edge(gene, drug, weight=row["Score"])
+
+    # Verificar si la red tiene nodos
+    if len(G.nodes) == 0:
+        print("La red está vacía después del filtrado. Intenta con más genes.")
+    else:
+        print(f"Nodos en la red: {len(G.nodes)} | Aristas en la red: {len(G.edges)}")
+
+        # Separar nodos en dos grupos: genes (centro) y fármacos (exterior)
+        genes = [n for n in G.nodes if G.nodes[n]["type"] == "gene"]
+        drugs = [n for n in G.nodes if G.nodes[n]["type"] == "drug"]
+
+        # Posiciones de los nodos: genes en el centro, fármacos alrededor
+        pos = nx.shell_layout(G, [genes, drugs])
+
+        # Colorear nodos según tipo
+        colors = ["lightblue" if n in genes else "lightcoral" for n in G.nodes]
+
+        # Etiquetas para TODOS los nodos (genes y fármacos seleccionados)
+        labels = {node: G.nodes[node]["label"] for node in G.nodes}
+
+        # Dibujar la red
+        plt.figure(figsize=(14, 10))
+        nx.draw(G, pos, with_labels=True, labels=labels, node_color=colors, edge_color="gray", 
+                node_size=1000, font_size=7)
+        
+        plt.title("Red Gen-Fármaco (genes en el centro, fármacos en el exterior)")
+        plt.show()
+
+```
+
+
+
+## 1.5 Obtención de Características de cada gen
+
+### 1.5.1 Características de Centralidad a partir de la red PPI
+
+Calcular el grado (`degree`), la centralidad de grado (`Degree_Centrality`), centralidad de intermediación	 (`Betweenness_Centrality`), centralidad de cercanía (`Closeness_Centrality`), Centralidad de vector propio (`Eigenvector_Centrality`), Núcleo-k (`K-core`), `PageRank` y Coeficiente de agrupamiento (`Clustering_Coefficient`).
+
+```{python}
+import networkx as nx
+import matplotlib.pyplot as plt
+import pandas as pd
+
+# Crear grafo no dirigido a partir de las columnas de interacción entre genes
+G = nx.from_pandas_edgelist(df_ppi, "Official Symbol Interactor A", "Official Symbol Interactor B")
+
+# ----------------------------------------------
+# Calcular métricas de red para cada gen (nodo)
+# ---------------------------------------------- 
+
+# Número total de conexiones por nodo (interacciones directas)
+degree_dict = dict(G.degree())  
+
+# Centralidad basada en grado (normalizada entre 0 y 1)
+degree_centrality = nx.degree_centrality(G)  
+
+# Mide cuántos caminos más cortos pasan por el nodo (importancia en la red)
+betweenness_centrality = nx.betweenness_centrality(G)  
+
+# Inverso de la suma de distancias desde un nodo a todos los demás (eficiencia de acceso o qué tan cerca está del resto)
+closeness_centrality = nx.closeness_centrality(G)  
+
+# Importancia de un nodo basada en la importancia de sus vecinos
+# Similar a degree centrality, pero pondera más los nodos conectados a otros importantes.
+eigenvector_centrality = nx.eigenvector_centrality(G, max_iter=1000)  
+
+# Cuán interconectado está un nodo dentro de una subred densa
+k_core = nx.core_number(G)  
+
+# Influencia global del nodo considerando tanto cantidad como calidad de sus conexiones (similar a Google PageRank)
+pagerank = nx.pagerank(G)  
+
+# Coeficiente de agrupamiento (cómo de bien están conectados los vecinos del nodo)
+clustering = nx.clustering(G)  
+
+# -------------------------------
+# Convertir a DataFrame
+# -------------------------------
+
+ppi_metrics = pd.DataFrame({
+    "Gene": list(G.nodes),
+    "Degree": [degree_dict[g] for g in G.nodes],
+    "Degree_Centrality": [degree_centrality[g] for g in G.nodes],
+    "Betweenness_Centrality": [betweenness_centrality[g] for g in G.nodes],
+    "Closeness_Centrality": [closeness_centrality[g] for g in G.nodes],
+    "Eigenvector_Centrality": [eigenvector_centrality[g] for g in G.nodes],
+    "K-core": [k_core[g] for g in G.nodes],
+    "PageRank": [pagerank[g] for g in G.nodes],
+    "Clustering_Coefficient": [clustering[g] for g in G.nodes]
+})
+
+# Mostrar las primeras filas de la tabla con métricas
+print(ppi_metrics.head())
+
+```
+
+### 1.5.2 Número de fármacos aprobados o en ensayos clínicos por gen
+```{python}
+import pandas as pd
+
+# Contar el número de fármacos por gen
+drug_counts = df_interactions.groupby("Gene")["Drug"].nunique().reset_index()
+drug_counts.columns = ["Gene", "Num_Drugs"]
+
+# Mostrar los primeros resultados
+print(drug_counts.head())
+
+```
+
+### 1.5.3 Nº de ORTÓLOGOS por gen en ENSEMBLE:
+
+**Función `get_orthologs` para consultar la API de Ensembl y obtener el número de ortólogos (genes homólogos en otras especies) asociados a un gen humano.**
+```{python}
+import requests
+import pandas as pd
+
+def get_orthologs(gene_name, species="human"):
+    # Construir la URL de la API REST de Ensembl para buscar ortólogos por símbolo de gen
+    url = f"https://rest.ensembl.org/homology/symbol/{species}/{gene_name}?content-type=application/json"
+    
+    # Realizar la solicitud HTTP GET
+    response = requests.get(url)
+
+    # Si la solicitud fue exitosa (código 200)
+    if response.status_code == 200:
+        data = response.json()
+        
+        # Verificar que existan datos y homologías
+        if "data" in data and len(data["data"]) > 0 and "homologies" in data["data"][0]:
+            return len(data["data"][0]["homologies"])  # Devolver el número de ortólogos encontrados
+        else:
+            return 0  # No se encontraron ortólogos
+    else:
+        return None  # Fallo en la solicitud HTTP
+
+```
+
+**Aplicar la función para nuestra lista de genes.**
+```{python}
+# 'genes_ppi': lista de nombres de genes (símbolos HGNC)
+ortholog_counts = {gene: get_orthologs(gene) for gene in genes_ppi}
+
+# Convertir los resultados a un DataFrame de pandas
+
+df_orthologs = pd.DataFrame(
+    list(ortholog_counts.items()),
+    columns=["Gene", "Num_Orthologs"] # Cada fila: un gen y su número de ortólogos
+)
+
+
+# Mostrar las primeras filas de la tabla de ortólogos
+print(df_orthologs.head())
+```
+
+# DF que combina todas las características de cada gen:
+```{python}
+# Unir los DataFrames sin incluir df_domains
+df_final = ppi_metrics.merge(drug_counts, on="Gene", how="left") \
+                      .merge(df_orthologs, on="Gene", how="left")
+
+# Rellenar, si es necesario, NaNs con 0
+df_final.fillna({"Num_Drugs": 0, "Num_Orthologs": 0}, inplace=True)
+
+# Guardar el DataFrame como un archivo CSV
+df_final.to_csv("ppi_analysis_results.csv", index=False, encoding="utf-8")
+
+print("Archivo 'caracteristics_ppi_ALZHEIMER.csv' guardado exitosamente.")
+
+
+```
+
+
